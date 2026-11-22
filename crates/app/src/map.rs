@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::{
-    hsla, point, px, quad, size, transparent_black, App, BorderStyle, Bounds, Hsla, PathBuilder,
+    hsla, point, px, quad, size, App, BorderStyle, Bounds, Hsla, PathBuilder,
     Pixels, Point, SharedString, TextRun, Window,
 };
 use trackmap_core::Camelot;
@@ -219,24 +219,9 @@ impl Frame {
         let t = &self.theme;
         let font = window.text_style().font();
 
-        // Key wheel guides: ring boundaries and key names.
+        // Key names around the wheel: minor keys inside, major keys outside.
         let layout = HarmonicLayout::default();
-        let minor_out = layout.inner + layout.ring_width;
-        let major_in = minor_out + layout.gap;
-        let major_out = major_in + layout.ring_width;
-        let guide: Hsla = Hsla::from(t.border).opacity(0.8);
-        let c = tf.to_screen(WorldPoint { x: 0., y: 0. });
-        for r in [layout.inner, minor_out, major_in, major_out] {
-            let rs = px(r * tf.scale);
-            window.paint_quad(quad(
-                Bounds::new(point(c.x - rs, c.y - rs), size(rs * 2., rs * 2.)),
-                rs,
-                transparent_black(),
-                px(1.),
-                guide,
-                BorderStyle::Solid,
-            ));
-        }
+        let major_out = layout.inner + 2. * layout.ring_width + layout.gap;
         for n in 1..=12u8 {
             for (minor, r) in [(true, layout.inner - 28.), (false, major_out + 28.)] {
                 let k = Camelot::new(n, minor).unwrap();

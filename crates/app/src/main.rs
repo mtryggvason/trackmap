@@ -13,7 +13,7 @@ use std::rc::Rc;
 use futures::StreamExt;
 
 use gpui::{
-    actions, canvas, div, relative, Focusable, point, prelude::*, px, size, uniform_list, AnyElement, App,
+    actions, canvas, div, Focusable, point, prelude::*, px, size, uniform_list, AnyElement, App,
     Bounds, Context, FocusHandle, KeyBinding, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, PinchEvent, RenderImage, ScrollEvent,
     SharedString,
@@ -92,6 +92,9 @@ struct Workspace {
     ticking: bool,
     /// Preview bar's progress track, for turning clicks into seek positions.
     progress_bounds: Rc<std::cell::Cell<Bounds<gpui::Pixels>>>,
+    /// Waveforms of played tracks, and tracks whose waveform is being computed.
+    waves: HashMap<PathBuf, Arc<Vec<f32>>>,
+    wave_loading: HashSet<PathBuf>,
     /// The name prompt (new / rename playlist), when open.
     prompt: Option<NamePrompt>,
     /// The song inspector's "Add to playlist" list is open.
@@ -195,6 +198,8 @@ impl Workspace {
             player: player::Player::default(),
             ticking: false,
             progress_bounds: Rc::new(std::cell::Cell::new(Bounds::default())),
+            waves: HashMap::new(),
+            wave_loading: HashSet::new(),
             prompt: None,
             adding_to_playlist: false,
             confirm_delete: None,
@@ -343,10 +348,10 @@ impl Workspace {
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
         let selected = self.selected_song();
         match (&selected, &self.player.track) {
-            (Some(s), current) if current.as_ref() != Some(s) => self.player.play(s),
+            (Some(s), current) if current.as_ref() != Some(s) => self.start_playback(s, cx),
             (_, Some(current)) if self.player.finished() => {
                 let current = current.clone();
-                self.player.play(&current);
+                self.start_playback(&current, cx);
             }
             (_, Some(_)) => self.player.toggle(),
             _ => {}
@@ -355,8 +360,34 @@ impl Workspace {
         cx.notify();
     }
 
-    fn play_song(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+    /// Starts a track and fetches its waveform (cached, or computed in the background).
+    fn start_playback(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         self.player.play(path);
+        if self.waves.contains_key(path) || !self.wave_loading.insert(path.to_path_buf()) {
+            return;
+        }
+        let LibraryState::Loaded(lib) = &self.library else { return };
+        let Some(track) = lib.tracks.iter().find(|t| t.path == path).cloned() else { return };
+        let root = lib.root.clone();
+        cx.spawn(async move |this, cx| {
+            let wave = cx
+                .background_executor()
+                .spawn(async move { trackmap_core::waveform::load_or_compute(&root, &track).map(|w| (track.path, w)) })
+                .await;
+            this.update(cx, |ws, cx| {
+                if let Some((path, w)) = wave {
+                    ws.wave_loading.remove(&path);
+                    ws.waves.insert(path, Arc::new(w));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn play_song(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.start_playback(path, cx);
         self.start_ticking(cx);
         cx.notify();
     }
@@ -368,7 +399,7 @@ impl Workspace {
         }
         self.ticking = true;
         cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
             let keep = this.update(cx, |ws, cx| {
                 cx.notify();
                 if !ws.player.is_playing() {
@@ -1723,6 +1754,7 @@ impl Workspace {
             None => player::clock(pos),
         };
         let bounds_cell = self.progress_bounds.clone();
+        let wave = p.track.as_ref().and_then(|path| self.waves.get(path).cloned());
         div()
             .flex()
             .items_center()
@@ -1762,23 +1794,13 @@ impl Workspace {
                 div()
                     .id("progress")
                     .flex_1()
-                    .h(px(16.))
-                    .flex()
-                    .items_center()
+                    .h(px(34.))
                     .cursor_pointer()
                     .child(
-                        div()
-                            .relative()
-                            .w_full()
-                            .h(px(4.))
-                            .rounded_full()
-                            .bg(t.bg_elevated)
-                            .child(div().absolute().left_0().top_0().h_full().w(relative(frac)).rounded_full().bg(t.accent))
-                            .child(
-                                canvas(move |b, _, _| bounds_cell.set(b), |_, _, _, _| {})
-                                    .absolute()
-                                    .size_full(),
-                            ),
+                        canvas(move |b, _, _| bounds_cell.set(b), move |b, _, window, _| {
+                            paint_waveform(window, b, wave.as_deref().map(|w| w.as_slice()), frac, &t)
+                        })
+                        .size_full(),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1886,6 +1908,40 @@ impl Render for Workspace {
             .children(self.palette.map(|m| self.palette(m, &t)))
             .children(self.prompt.as_ref().map(|p| self.prompt_view(p, &t)))
     }
+}
+
+/// Draws a track's waveform as mirrored bars (played part in the accent colour) with a playhead.
+/// Without a waveform yet, draws a thin progress line.
+fn paint_waveform(window: &mut Window, b: Bounds<gpui::Pixels>, wave: Option<&[f32]>, frac: f32, t: &Theme) {
+    use gpui::{fill, point, Hsla};
+    let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
+    let accent: Hsla = t.accent.into();
+    let muted: Hsla = Hsla::from(t.text_muted).opacity(0.45);
+    let Some(wave) = wave.filter(|w| !w.is_empty() && w.len() >= 2) else {
+        let line = |x0: f32, x1: f32, c: Hsla| {
+            fill(Bounds::new(point(b.origin.x + px(x0), b.center().y - px(1.5)), size(px((x1 - x0).max(0.)), px(3.))), c)
+        };
+        window.paint_quad(line(0., w, t.bg_elevated.into()));
+        window.paint_quad(line(0., w * frac, accent));
+        return;
+    };
+    const BAR: f32 = 2.0;
+    const GAP: f32 = 1.0;
+    let n = ((w / (BAR + GAP)) as usize).max(1);
+    for k in 0..n {
+        let lo = k * wave.len() / n;
+        let hi = ((k + 1) * wave.len() / n).max(lo + 1).min(wave.len());
+        let v = wave[lo..hi].iter().cloned().fold(0.0f32, f32::max);
+        let bar_h = (v * h).max(1.5);
+        let x = b.origin.x + px(k as f32 * (BAR + GAP));
+        let played = (k as f32 + 0.5) / n as f32 <= frac;
+        window.paint_quad(fill(
+            Bounds::new(point(x, b.center().y - px(bar_h / 2.)), size(px(BAR), px(bar_h))),
+            if played { accent } else { muted },
+        ));
+    }
+    let head = b.origin.x + px(w * frac);
+    window.paint_quad(fill(Bounds::new(point(head - px(0.75), b.origin.y), size(px(1.5), b.size.height)), Hsla::from(t.text)));
 }
 
 fn remember_library(root: &std::path::Path) {

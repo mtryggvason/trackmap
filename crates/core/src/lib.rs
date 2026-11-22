@@ -12,6 +12,7 @@ pub mod settings;
 pub mod tags;
 pub mod tempo;
 pub mod watch;
+pub mod waveform;
 
 use std::path::{Component, Path, PathBuf};
 

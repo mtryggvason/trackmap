@@ -121,12 +121,13 @@ Done (first version):
 - Click a song, then **Space** to play/pause it (or ▶ Play in the inspector). Space resumes or
   restarts what's loaded when no other song is selected.
 - **← / →** jump back/forward 10 s.
-- Preview bar: play/pause, title and artist, elapsed / total, progress bar (click to seek).
+- Preview bar: play/pause, title and artist, elapsed / total, and the track's waveform (played
+  part in orange, click to seek). Waveforms are computed in the background on first play and
+  cached in `.trackmap/waves/`.
 - The playing song has an orange ring on the map.
 - Decoding reuses the analysis decoder (symphonia) as a seekable stream; rodio only does output.
 
 Next:
-- Waveform in the inspector and preview bar (peaks computed in the analysis pass, cached).
 - Start position option (e.g. 30%) to skip intros.
 - Arrow keys to jump to the nearest compatible track (key ±1, close BPM) and preview it.
 - Output device picker (cpal) for headphones on a multi-output interface.

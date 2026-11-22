@@ -13,6 +13,9 @@ fn main() {
         let bpm_ms = t.elapsed().as_millis();
         let t = Instant::now();
         let key = trackmap_core::key_detect::detect_file(path);
+        let t = Instant::now();
+        let wave = trackmap_core::waveform::compute(path);
+        eprintln!("waveform: {} bins in {} ms", wave.map_or(0, |w| w.len()), t.elapsed().as_millis());
         let show = |v: Option<String>| v.unwrap_or("-".into());
         println!(
             "BPM {:>6} (tag {:>6}) {:>4} ms | key {:>4} (tag {:>4}) {:>4} ms | {}",

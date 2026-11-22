@@ -18,6 +18,16 @@ pub struct Library {
 }
 
 impl Library {
+    /// Records artwork lookups. Tracks that have since disappeared are ignored.
+    pub fn set_art(&mut self, results: Vec<(PathBuf, crate::Art)>) {
+        let mut by_path: HashMap<PathBuf, crate::Art> = results.into_iter().collect();
+        for t in &mut self.tracks {
+            if let Some(art) = by_path.remove(&t.path) {
+                t.art = art;
+            }
+        }
+    }
+
     pub fn artist_count(&self) -> usize {
         distinct(self.tracks.iter().filter_map(|t| t.artist.as_deref()))
     }

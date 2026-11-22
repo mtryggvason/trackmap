@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use lofty::config::WriteOptions;
+use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::*;
 use lofty::tag::{Tag, TagType};
 use trackmap_core::playlists;
@@ -57,6 +58,30 @@ fn wav() -> Vec<u8> {
     b
 }
 
+/// A simple 300px cover: diagonal gradient between two colours derived from the artist index.
+fn cover(index: usize) -> Vec<u8> {
+    let hue = index as f32 / ARTISTS.len() as f32;
+    let rgb = |h: f32, l: f32| {
+        let f = |n: f32| {
+            let k = (n + h * 12.0) % 12.0;
+            let a = 0.7 * l.min(1.0 - l);
+            ((l - a * (k - 3.0).min(9.0 - k).clamp(-1.0, 1.0)) * 255.0) as u8
+        };
+        [f(0.0), f(8.0), f(4.0)]
+    };
+    let (a, b) = (rgb(hue, 0.35), rgb((hue + 0.15) % 1.0, 0.65));
+    let img = image::RgbImage::from_fn(300, 300, |x, y| {
+        let t = (x + y) as f32 / 598.0;
+        let mix = |i: usize| (a[i] as f32 * (1.0 - t) + b[i] as f32 * t) as u8;
+        // A light disc so covers aren't just gradients.
+        let (dx, dy) = (x as f32 - 150.0, y as f32 - 150.0);
+        if (dx * dx + dy * dy).sqrt() < 60.0 { image::Rgb([235, 235, 235]) } else { image::Rgb([mix(0), mix(1), mix(2)]) }
+    });
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).expect("encode cover");
+    out.into_inner()
+}
+
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1);
     let root = PathBuf::from(args.next().expect("usage: demo_library <dir> [count]"));
@@ -83,8 +108,14 @@ fn main() -> std::io::Result<()> {
         };
         let key = format!("{}{}", 1 + rng.next() % 12, if rng.next() % 3 == 0 { "B" } else { "A" });
 
+        let artist_ix = ARTISTS.iter().position(|a| *a == artist).unwrap();
         let dir = root.join(artist);
         std::fs::create_dir_all(&dir)?;
+        // The last artist keeps covers as a folder image instead of embedding them.
+        let folder_art = artist_ix == ARTISTS.len() - 1;
+        if folder_art && !dir.join("cover.png").exists() {
+            std::fs::write(dir.join("cover.png"), cover(artist_ix))?;
+        }
         let path = dir.join(format!("{i:03} {title}.wav"));
         std::fs::write(&path, wav())?;
         let mut tag = Tag::new(TagType::Id3v2);
@@ -95,6 +126,15 @@ fn main() -> std::io::Result<()> {
         // A few tracks without a key, as in real libraries.
         if rng.next() % 15 != 0 {
             tag.insert_text(ItemKey::InitialKey, key);
+        }
+        // Most tracks get the artist's cover; some have none, like real libraries.
+        if !folder_art && rng.next() % 6 != 0 {
+            tag.push_picture(
+                Picture::unchecked(cover(artist_ix))
+                    .pic_type(PictureType::CoverFront)
+                    .mime_type(MimeType::Png)
+                    .build(),
+            );
         }
         tag.save_to_path(&path, WriteOptions::default()).map_err(std::io::Error::other)?;
         paths.push(path);

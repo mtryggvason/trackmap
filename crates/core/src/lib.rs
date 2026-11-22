@@ -1,5 +1,6 @@
 //! Library model shared by the graph and the app. No UI code lives here.
 
+pub mod artwork;
 pub mod cache;
 pub mod changes;
 pub mod key;
@@ -12,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use artwork::Art;
 pub use changes::{changes_for, Change};
 pub use key::Camelot;
 pub use playlists::Playlist;
@@ -70,6 +72,9 @@ pub struct Track {
     /// File size and modification time (Unix seconds), used to skip re-reading unchanged files.
     pub size: u64,
     pub modified: Option<u64>,
+    /// Cover thumbnail, looked up in the background after scanning.
+    #[serde(default)]
+    pub art: Art,
 }
 
 #[cfg(test)]

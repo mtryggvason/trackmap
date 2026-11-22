@@ -85,7 +85,7 @@ highlights its songs and dims the rest; they never appear as nodes.
   and both scales refit to the group (its BPM range, only the keys it uses). The previous view
   is saved; Esc deselects a song inside the group first, then leaves the group and restores it.
 - Click a song: it's highlighted, and the inspector lists its artist, label and playlists as links.
-- Artists ▾ / Labels ▾ / Playlists ▾ chips open a list; picking one highlights its songs.
+- Artists ▾ / Albums ▾ / Labels ▾ / Playlists ▾ chips open a list; picking one narrows the map to its songs.
 - A selected label lists its artists in the inspector (label → artist → songs).
 - A selected playlist also draws its route through the map in play order, numbered.
 - Filters (New, later search/BPM/key) limit which songs are shown; a selection's songs always show.

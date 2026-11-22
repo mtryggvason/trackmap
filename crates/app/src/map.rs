@@ -78,6 +78,7 @@ pub struct Animated {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Picker {
     Artists,
+    Albums,
     Labels,
     Playlists,
 }

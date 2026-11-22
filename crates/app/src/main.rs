@@ -903,6 +903,7 @@ impl Workspace {
             )
             .children([
                 (Picker::Artists, "artists", "Artists"),
+                (Picker::Albums, "albums", "Albums"),
                 (Picker::Labels, "labels", "Labels"),
                 (Picker::Playlists, "playlists", "Playlists"),
             ]
@@ -1271,6 +1272,7 @@ impl Workspace {
                 NodeId::Artist(_) => "Artist",
                 NodeId::Label(_) => "Label",
                 NodeId::Playlist(_) => "Playlist",
+                NodeId::Album(_) => "Album",
                 NodeId::Song(_) => "Song",
             };
             format!("{kind}: {}  ·  ", graph.name(n))
@@ -1399,6 +1401,7 @@ impl Workspace {
         let t = *t;
         let (names, make): (&[String], fn(usize) -> NodeId) = match kind {
             Picker::Artists => (&graph.artists, NodeId::Artist),
+            Picker::Albums => (&graph.albums, NodeId::Album),
             Picker::Labels => (&graph.labels, NodeId::Label),
             Picker::Playlists => (&graph.playlists, NodeId::Playlist),
         };
@@ -1533,6 +1536,10 @@ impl Workspace {
                 if let Some(a) = graph.artist_of(i) {
                     rows.push(heading("Artist").into_any_element());
                     rows.push(link(0, NodeId::Artist(a), cx).into_any_element());
+                }
+                if let Some(al) = graph.album_of(i) {
+                    rows.push(heading("Album").into_any_element());
+                    rows.push(link(2, NodeId::Album(al), cx).into_any_element());
                 }
                 if let Some(l) = graph.label_of(i) {
                     rows.push(heading("Label").into_any_element());
@@ -1706,6 +1713,7 @@ impl Workspace {
                 let (kind, what) = match n {
                     NodeId::Artist(_) => ("Artist", "Songs"),
                     NodeId::Label(_) => ("Label", "Artists"),
+                    NodeId::Album(_) => ("Album", "Songs"),
                     _ => ("Playlist", "Songs"),
                 };
                 let items = graph.neighbours(n);

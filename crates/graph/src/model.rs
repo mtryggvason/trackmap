@@ -16,6 +16,7 @@ pub enum NodeId {
     Artist(usize),
     Label(usize),
     Playlist(usize),
+    Album(usize),
 }
 
 /// A node identity that survives rebuilding the graph (indices shift when tracks are added).
@@ -25,6 +26,7 @@ pub enum NodeKey {
     Artist(String),
     Label(String),
     Playlist(String),
+    Album(String),
 }
 
 #[derive(Debug, Default)]
@@ -36,9 +38,12 @@ pub struct Graph {
     pub artists: Vec<String>,
     pub labels: Vec<String>,
     pub playlists: Vec<String>,
+    pub albums: Vec<String>,
 
     song_artist: Vec<Option<usize>>,
     song_label: Vec<Option<usize>>,
+    song_album: Vec<Option<usize>>,
+    album_songs: Vec<Vec<usize>>,
     song_playlists: Vec<Vec<usize>>,
     artist_songs: Vec<Vec<usize>>,
     label_songs: Vec<Vec<usize>>,
@@ -67,15 +72,17 @@ impl Graph {
     pub fn build(tracks: &[Track], playlists: &[Playlist]) -> Self {
         let layout = &MapLayout::fit(tracks.iter().filter_map(|t| t.tempo()));
         let mut g = Graph { layout: *layout, ..Graph::default() };
-        let (mut artist_ix, mut label_ix) = (HashMap::new(), HashMap::new());
+        let (mut artist_ix, mut label_ix, mut album_ix) = (HashMap::new(), HashMap::new(), HashMap::new());
 
         for t in tracks {
             g.song_titles.push(t.title.clone().unwrap_or_default());
             g.song_paths.push(t.path.clone());
             let a = tag(&t.artist).map(|s| intern(&mut artist_ix, &mut g.artists, s));
             let l = tag(&t.label).map(|s| intern(&mut label_ix, &mut g.labels, s));
+            let al = tag(&t.album).map(|s| intern(&mut album_ix, &mut g.albums, s));
             g.song_artist.push(a);
             g.song_label.push(l);
+            g.song_album.push(al);
             g.song_playlists.push(Vec::new());
         }
 
@@ -92,7 +99,11 @@ impl Graph {
         g.artist_songs = vec![Vec::new(); g.artists.len()];
         g.label_songs = vec![Vec::new(); g.labels.len()];
         g.label_artists = vec![Vec::new(); g.labels.len()];
+        g.album_songs = vec![Vec::new(); g.albums.len()];
         for s in 0..tracks.len() {
+            if let Some(al) = g.song_album[s] {
+                g.album_songs[al].push(s);
+            }
             if let Some(a) = g.song_artist[s] {
                 g.artist_songs[a].push(s);
             }
@@ -126,6 +137,7 @@ impl Graph {
             NodeId::Artist(i) => NodeKey::Artist(self.artists[i].clone()),
             NodeId::Label(i) => NodeKey::Label(self.labels[i].clone()),
             NodeId::Playlist(i) => NodeKey::Playlist(self.playlists[i].clone()),
+            NodeId::Album(i) => NodeKey::Album(self.albums[i].clone()),
         }
     }
 
@@ -137,6 +149,7 @@ impl Graph {
             NodeKey::Artist(s) => pos(&self.artists, s).map(NodeId::Artist),
             NodeKey::Label(s) => pos(&self.labels, s).map(NodeId::Label),
             NodeKey::Playlist(s) => pos(&self.playlists, s).map(NodeId::Playlist),
+            NodeKey::Album(s) => pos(&self.albums, s).map(NodeId::Album),
         }
     }
 
@@ -146,6 +159,10 @@ impl Graph {
 
     pub fn label_of(&self, song: usize) -> Option<usize> {
         self.song_label[song]
+    }
+
+    pub fn album_of(&self, song: usize) -> Option<usize> {
+        self.song_album[song]
     }
 
     pub fn playlists_of(&self, song: usize) -> &[usize] {
@@ -160,6 +177,7 @@ impl Graph {
             NodeId::Artist(i) => &self.artist_songs[i],
             NodeId::Label(i) => &self.label_songs[i],
             NodeId::Playlist(i) => &self.playlist_songs[i],
+            NodeId::Album(i) => &self.album_songs[i],
         };
         v.to_vec()
     }
@@ -184,6 +202,7 @@ impl Graph {
             NodeId::Artist(i) => &self.artists[i],
             NodeId::Label(i) => &self.labels[i],
             NodeId::Playlist(i) => &self.playlists[i],
+            NodeId::Album(i) => &self.albums[i],
         }
     }
 
@@ -243,6 +262,7 @@ impl Graph {
             NodeId::Playlist(p) => {
                 self.playlist_songs[p].iter().map(|&s| NodeId::Song(s)).collect()
             }
+            NodeId::Album(a) => self.album_songs[a].iter().map(|&s| NodeId::Song(s)).collect(),
         }
     }
 
@@ -296,6 +316,21 @@ mod tests {
         assert_eq!(g2.find(&NodeKey::Playlist("Warmup".into())), None);
         assert_eq!(g2.songs_of(NodeId::Artist(1)), [1, 2, 3]);
         assert_eq!(g2.songs_of(NodeId::Song(0)), [0]);
+    }
+
+    #[test]
+    fn albums_group_songs_across_artists() {
+        let mut a = track("/a", "Ann", "", "8A", 124.0);
+        let mut b = track("/b", "Bob", "", "9A", 126.0);
+        let c = track("/c", "Ann", "", "8A", 124.0);
+        a.album = Some("Compilation".into());
+        b.album = Some("Compilation".into());
+        let g = Graph::build(&[a, b, c], &[]);
+        assert_eq!(g.albums, ["Compilation"]);
+        assert_eq!(g.songs_of(NodeId::Album(0)), [0, 1]);
+        assert_eq!(g.album_of(2), None);
+        assert_eq!(g.find(&NodeKey::Album("Compilation".into())), Some(NodeId::Album(0)));
+        assert_eq!(g.neighbours(NodeId::Album(0)), [NodeId::Song(0), NodeId::Song(1)]);
     }
 
     #[test]

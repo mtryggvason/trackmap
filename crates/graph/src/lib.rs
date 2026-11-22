@@ -2,7 +2,7 @@
 
 mod model;
 
-pub use model::{Graph, NodeId};
+pub use model::{Graph, NodeId, NodeKey};
 use trackmap_core::Camelot;
 
 #[derive(Debug, Clone, Copy, PartialEq)]

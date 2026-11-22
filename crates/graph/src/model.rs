@@ -18,9 +18,19 @@ pub enum NodeId {
     Playlist(usize),
 }
 
+/// A node identity that survives rebuilding the graph (indices shift when tracks are added).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NodeKey {
+    Song(PathBuf),
+    Artist(String),
+    Label(String),
+    Playlist(String),
+}
+
 #[derive(Debug, Default)]
 pub struct Graph {
     pub song_titles: Vec<String>,
+    pub song_paths: Vec<PathBuf>,
     pub artists: Vec<String>,
     pub labels: Vec<String>,
     pub playlists: Vec<String>,
@@ -58,6 +68,7 @@ impl Graph {
 
         for t in tracks {
             g.song_titles.push(t.title.clone().unwrap_or_default());
+            g.song_paths.push(t.path.clone());
             let a = tag(&t.artist).map(|s| intern(&mut artist_ix, &mut g.artists, s));
             let l = tag(&t.label).map(|s| intern(&mut label_ix, &mut g.labels, s));
             g.song_artist.push(a);
@@ -99,6 +110,48 @@ impl Graph {
         g.label_pos = g.label_songs.iter().map(|s| g.orbit(s, 140.0)).collect();
         g.playlist_pos = g.playlist_songs.iter().map(|s| g.orbit(s, 210.0)).collect();
         g
+    }
+
+    pub fn key(&self, n: NodeId) -> NodeKey {
+        match n {
+            NodeId::Song(i) => NodeKey::Song(self.song_paths[i].clone()),
+            NodeId::Artist(i) => NodeKey::Artist(self.artists[i].clone()),
+            NodeId::Label(i) => NodeKey::Label(self.labels[i].clone()),
+            NodeId::Playlist(i) => NodeKey::Playlist(self.playlists[i].clone()),
+        }
+    }
+
+    /// Finds a node by key; `None` if it no longer exists.
+    pub fn find(&self, key: &NodeKey) -> Option<NodeId> {
+        let pos = |v: &[String], s: &str| v.iter().position(|x| x == s);
+        match key {
+            NodeKey::Song(p) => self.song_paths.iter().position(|x| x == p).map(NodeId::Song),
+            NodeKey::Artist(s) => pos(&self.artists, s).map(NodeId::Artist),
+            NodeKey::Label(s) => pos(&self.labels, s).map(NodeId::Label),
+            NodeKey::Playlist(s) => pos(&self.playlists, s).map(NodeId::Playlist),
+        }
+    }
+
+    pub fn artist_of(&self, song: usize) -> Option<usize> {
+        self.song_artist[song]
+    }
+
+    pub fn label_of(&self, song: usize) -> Option<usize> {
+        self.song_label[song]
+    }
+
+    pub fn playlists_of(&self, song: usize) -> &[usize] {
+        &self.song_playlists[song]
+    }
+
+    /// Songs belonging to an artist, label or playlist (empty for a song).
+    pub fn songs_of(&self, n: NodeId) -> &[usize] {
+        match n {
+            NodeId::Song(_) => &[],
+            NodeId::Artist(i) => &self.artist_songs[i],
+            NodeId::Label(i) => &self.label_songs[i],
+            NodeId::Playlist(i) => &self.playlist_songs[i],
+        }
     }
 
     pub fn song_count(&self) -> usize {
@@ -258,6 +311,22 @@ mod tests {
                 .collect(),
         }];
         Graph::build(&tracks, &playlists, &HarmonicLayout::default())
+    }
+
+    #[test]
+    fn keys_survive_rebuilds() {
+        let g = sample();
+        for n in [NodeId::Song(2), NodeId::Artist(1), NodeId::Label(1), NodeId::Playlist(0)] {
+            assert_eq!(g.find(&g.key(n)), Some(n));
+        }
+        // A rebuild with an extra track first shifts song indices, but keys still resolve.
+        let mut tracks = vec![track("/0", "Zed", "", "1A", 120.0)];
+        tracks.extend(["/a", "/b", "/c"].map(|p| track(p, "Ann", "Lab1", "8A", 124.0)));
+        let g2 = Graph::build(&tracks, &[], &HarmonicLayout::default());
+        assert_eq!(g2.find(&g.key(NodeId::Song(0))), Some(NodeId::Song(1)));
+        assert_eq!(g2.find(&NodeKey::Playlist("Warmup".into())), None);
+        assert_eq!(g2.songs_of(NodeId::Artist(1)), [1, 2, 3]);
+        assert!(g2.songs_of(NodeId::Song(0)).is_empty());
     }
 
     #[test]

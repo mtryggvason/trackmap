@@ -1496,6 +1496,12 @@ impl Workspace {
         let route_of = selected.filter(|n| matches!(n, NodeId::Playlist(_))).or(scope);
         let anim = self.map.animate(&positions, &shown, now);
         animating |= anim.running;
+        // The hovered song, and the selected song, ease up to a larger size.
+        let mut big: Vec<usize> = self.map.hovered.into_iter().collect();
+        if let Some(NodeId::Song(s)) = highlight {
+            big.push(s);
+        }
+        animating |= self.map.step_grow(&big, now);
         if animating {
             window.request_animation_frame();
         }

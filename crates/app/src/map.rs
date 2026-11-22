@@ -172,6 +172,9 @@ pub struct MapState {
     pub cover: f32,
     pinch: Option<Pinch>,
     glide: Option<ZoomGlide>,
+    /// How far each song has grown towards its hover/selected size (0 → 1), eased over time.
+    grow: HashMap<usize, f32>,
+    grow_step: Option<Instant>,
 }
 
 impl Default for MapState {
@@ -199,6 +202,8 @@ impl Default for MapState {
             cover: 16.0,
             pinch: None,
             glide: None,
+            grow: HashMap::new(),
+            grow_step: None,
         }
     }
 }
@@ -335,6 +340,33 @@ impl MapState {
             return false;
         }
         true
+    }
+
+    /// Eases songs towards their hover/selected size: `big` songs grow, the rest shrink back.
+    /// Returns whether any is still changing.
+    pub fn step_grow(&mut self, big: &[usize], now: Instant) -> bool {
+        let dt = self.grow_step.map_or(0.0, |t| (now - t).as_secs_f32()).min(0.05);
+        self.grow_step = Some(now);
+        let k = 1.0 - (-dt / 0.06).exp();
+        for &s in big {
+            self.grow.entry(s).or_insert(0.0);
+        }
+        let mut running = false;
+        self.grow.retain(|s, v| {
+            let target = if big.contains(s) { 1.0 } else { 0.0 };
+            *v += (target - *v) * k;
+            if (target - *v).abs() < 0.01 {
+                *v = target;
+            } else {
+                running = true;
+            }
+            *v > 0.0 || target > 0.0
+        });
+        running
+    }
+
+    pub fn grow_of(&self, song: usize) -> f32 {
+        self.grow.get(&song).copied().unwrap_or(0.0)
     }
 
     /// Positions to draw for `target` (the layout's positions) and `shown` songs, starting a
@@ -530,9 +562,9 @@ struct DrawSong {
     label_priority: u8,
     art: Option<Arc<RenderImage>>,
     dimmed: bool,
-    fill: Hsla,
     ring: Hsla,
-    big: bool,
+    /// 0 = normal size, 1 = hovered/selected size (eased in between).
+    grow: f32,
     label: Option<SharedString>,
     label_color: Hsla,
 }
@@ -574,7 +606,6 @@ impl Frame {
         state: &MapState,
         theme: &Theme,
     ) -> (Self, Vec<(usize, WorldPoint)>) {
-        let accent: Hsla = theme.accent.into();
         let text: Hsla = theme.text.into();
         let muted: Hsla = theme.text_muted.into();
 
@@ -600,9 +631,8 @@ impl Frame {
             label_priority: 4,
             art: arts.get(s).cloned().flatten(),
             dimmed: false,
-            fill: hsla(0., 0., 0.55, 1.),
             ring: keys[s].map(key_color).unwrap_or(muted),
-            big: false,
+            grow: 0.0,
             label: None,
             label_color: muted,
         });
@@ -614,11 +644,7 @@ impl Frame {
                 let in_focus = focus.contains(&s);
                 let is_hover = hovered == Some(s);
                 let ring = keys[s].map(key_color).unwrap_or(muted);
-                let (fill, ring) = match (has_focus, in_focus) {
-                    (true, true) => (accent, ring),
-                    (true, false) => (hsla(0., 0., 0.55, 0.2), ring.opacity(0.2)),
-                    _ => (hsla(0., 0., 0.55, 1.), ring),
-                };
+                let ring = if has_focus && !in_focus { ring.opacity(0.2) } else { ring };
                 let labelled = is_hover || in_focus || label_all;
                 DrawSong {
                     pos,
@@ -635,9 +661,8 @@ impl Frame {
                     },
                     art: arts.get(s).cloned().flatten(),
                     dimmed: has_focus && !in_focus,
-                    fill,
                     ring,
-                    big: is_hover || (in_focus && focus.len() == 1),
+                    grow: state.grow_of(s),
                     label: labelled.then(|| SharedString::from(graph.song_titles[s].clone())),
                     label_color: if is_hover || in_focus {
                         text
@@ -695,37 +720,27 @@ impl Frame {
         let mut node_boxes = Vec::with_capacity(self.songs.len());
         for s in &self.songs {
             let c = tf.to_screen(s.pos);
-            let d = if let Some(img) = &s.art {
-                // Cover: image, a dimming veil when out of focus, then the key-coloured outline.
-                let d = px(if s.big { (cover * 1.3).min(MAX_COVER * 1.15) } else { cover });
-                let b = Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d));
-                let radius = px(3.);
-                let _ = window.paint_image(b, b, radius.into(), img.clone(), 0, s.dimmed);
-                // Dimming and fading are a veil of background colour over the cover.
-                let veil = 1.0 - (1.0 - if s.dimmed { 0.7 } else { 0.0 }) * s.alpha;
-                if veil > 0.0 {
-                    window.paint_quad(quad(b, radius, bg.opacity(veil), px(0.), bg, BorderStyle::Solid));
+            // Hovered and selected covers grow smoothly (see MapState::step_grow).
+            let d = px((cover * (1.0 + 0.3 * ease(s.grow))).min(MAX_COVER * 1.15));
+            let b = Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d));
+            let radius = px(3.);
+            match &s.art {
+                Some(img) => {
+                    let _ = window.paint_image(b, b, radius.into(), img.clone(), 0, s.dimmed);
                 }
-                window.paint_quad(quad(b, radius, transparent_black(), px(1.5), s.ring.opacity(s.alpha), BorderStyle::Solid));
-                d
-            } else {
-                let d = px(if s.big { 13. } else { 9. });
-                window.paint_quad(quad(
-                    Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d)),
-                    d / 2.,
-                    s.fill.opacity(s.alpha),
-                    px(1.5),
-                    s.ring.opacity(s.alpha),
-                    BorderStyle::Solid,
-                ));
-                d
-            };
+                None => paint_default_cover(window, b, radius),
+            }
+            // Dimming and fading are a veil of background colour over the cover.
+            let veil = 1.0 - (1.0 - if s.dimmed { 0.7 } else { 0.0 }) * s.alpha;
+            if veil > 0.0 {
+                window.paint_quad(quad(b, radius, bg.opacity(veil), px(0.), bg, BorderStyle::Solid));
+            }
+            window.paint_quad(quad(b, radius, transparent_black(), px(1.5), s.ring.opacity(s.alpha), BorderStyle::Solid));
             if s.playing {
                 // A ring a few pixels outside the cover marks what's playing.
                 let r = d + px(8.);
                 let ring = Bounds::new(point(c.x - r / 2., c.y - r / 2.), size(r, r));
-                let radius = if s.art.is_some() { px(5.) } else { r / 2. };
-                window.paint_quad(quad(ring, radius, transparent_black(), px(2.5), t.accent, BorderStyle::Solid));
+                window.paint_quad(quad(ring, px(5.), transparent_black(), px(2.5), t.accent, BorderStyle::Solid));
             }
             let (cx_, cy_, half) = (f32::from(c.x), f32::from(c.y), f32::from(d) / 2.0);
             node_boxes.push(Rect { x0: cx_ - half, y0: cy_ - half, x1: cx_ + half, y1: cy_ + half });
@@ -828,6 +843,33 @@ impl Frame {
             paint_text(window, cx, &font, &(i + 1).to_string(), 10., t.bg_app.into(), c, true);
         }
     }
+}
+
+/// The cover for songs without artwork: a black sleeve with a white centre label, like a
+/// white-label 12", with a few faint grooves around the label.
+fn paint_default_cover(window: &mut Window, b: Bounds<Pixels>, radius: Pixels) {
+    let side = f32::from(b.size.width);
+    let c = b.center();
+    let circle = |window: &mut Window, diameter: f32, fill: Hsla, border: Hsla, width: f32| {
+        let d = px(diameter);
+        window.paint_quad(quad(
+            Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d)),
+            d / 2.,
+            fill,
+            px(width),
+            border,
+            BorderStyle::Solid,
+        ));
+    };
+    window.paint_quad(quad(b, radius, hsla(0., 0., 0.05, 1.), px(0.), hsla(0., 0., 0., 0.), BorderStyle::Solid));
+    // Grooves, only when there's room to see them.
+    if side >= 28.0 {
+        for f in [0.86, 0.72] {
+            circle(window, side * f, transparent_black(), hsla(0., 0., 0.18, 1.), 1.0);
+        }
+    }
+    circle(window, side * 0.40, hsla(0., 0., 0.95, 1.), transparent_black(), 0.0);
+    circle(window, (side * 0.06).max(1.5), hsla(0., 0., 0.05, 1.), transparent_black(), 0.0);
 }
 
 /// Screen-space rectangle for label placement.
@@ -1158,6 +1200,29 @@ mod tests {
         s.zoom_towards(spot, 0.5);
         s.step_view(Instant::now() + TRANSITION * 2);
         assert_eq!(s.zoom, MIN_ZOOM);
+    }
+
+    #[test]
+    fn hover_grows_smoothly_and_shrinks_back() {
+        let mut s = MapState::default();
+        let t0 = Instant::now();
+        s.step_grow(&[], t0);
+        assert!(s.step_grow(&[3], t0 + Duration::from_millis(16)), "still growing");
+        let partway = s.grow_of(3);
+        assert!(partway > 0.0 && partway < 1.0);
+        let mut t = t0 + Duration::from_millis(16);
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            s.step_grow(&[3], t);
+        }
+        assert_eq!(s.grow_of(3), 1.0);
+        // Hover moves away: shrinks back and is forgotten.
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            s.step_grow(&[], t);
+        }
+        assert_eq!(s.grow_of(3), 0.0);
+        assert!(s.grow.is_empty());
     }
 
     #[test]

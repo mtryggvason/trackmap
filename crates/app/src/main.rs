@@ -906,6 +906,7 @@ impl Workspace {
     fn map_view(&mut self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let now = std::time::Instant::now();
         let mut animating = self.map.step_view(now);
+        animating |= self.map.step_glide(now);
         let (Some(graph), LibraryState::Loaded(lib)) = (self.graph.clone(), &self.library) else {
             return div().into_any_element();
         };
@@ -1062,7 +1063,7 @@ impl Workspace {
                 }),
             )
             .on_pinch(cx.listener(|this, e: &PinchEvent, _, cx| {
-                this.map.zoom_at(e.position, (1.0 + e.delta).clamp(0.5, 2.0));
+                this.map.pinch(e.position, e.delta, e.phase, std::time::Instant::now());
                 cx.notify();
             }))
             .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| {

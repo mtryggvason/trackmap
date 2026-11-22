@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use gpui::{
     hsla, point, px, quad, size, transparent_black, App, BorderStyle, Bounds, Hsla, PathBuilder,
-    Pixels, Point, RenderImage, SharedString, TextRun, Window,
+    Pixels, Point, RenderImage, SharedString, TextRun, TouchPhase, Window,
 };
 use trackmap_core::Camelot;
 use trackmap_graph::{Axis, Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint, KEY_ROWS};
@@ -38,6 +38,31 @@ struct ViewMotion {
     start: Instant,
     from: (Point<Pixels>, f32),
     to: (Point<Pixels>, f32),
+}
+
+/// Zoom limits. Pinching past them meets resistance and springs back on release.
+pub const MIN_ZOOM: f32 = 0.3;
+pub const MAX_ZOOM: f32 = 40.0;
+/// How far past a limit you can stretch (as a factor of the limit).
+const OVERSTRETCH: f32 = 1.6;
+/// How quickly released momentum dies away (seconds); larger glides further.
+const MOMENTUM_DECAY: f32 = 0.22;
+/// How quickly an overstretched zoom springs back (seconds).
+const SPRING: f32 = 0.10;
+
+/// A pinch that's in progress: when the last event came and how fast zoom was changing
+/// (natural log of zoom per second, smoothed).
+struct Pinch {
+    last: Instant,
+    velocity: f32,
+    anchor: Point<Pixels>,
+}
+
+/// Zoom still moving after the fingers lifted (momentum, then a spring back into the limits).
+struct ZoomGlide {
+    last: Instant,
+    velocity: f32,
+    anchor: Point<Pixels>,
 }
 
 /// What to draw this frame: every song's current position, how visible each shown song is
@@ -144,6 +169,8 @@ pub struct MapState {
     fit_step: Option<Instant>,
     /// Cover size in screen pixels this frame (also the click target size).
     pub cover: f32,
+    pinch: Option<Pinch>,
+    glide: Option<ZoomGlide>,
 }
 
 impl Default for MapState {
@@ -170,6 +197,8 @@ impl Default for MapState {
             fit: Fit::default(),
             fit_step: None,
             cover: 16.0,
+            pinch: None,
+            glide: None,
         }
     }
 }
@@ -329,12 +358,103 @@ impl MapState {
         Animated { positions, alpha, leaving, running }
     }
 
+    /// Zooms by `ln_factor` (natural log of the factor) around `anchor`, with resistance
+    /// beyond the limits like a rubber band.
+    fn stretch_zoom(&mut self, anchor: Point<Pixels>, ln_factor: f32) {
+        let outward = (self.zoom <= MIN_ZOOM && ln_factor < 0.0) || (self.zoom >= MAX_ZOOM && ln_factor > 0.0);
+        let l = if outward {
+            // Resistance grows the further past the limit you are.
+            let past = if self.zoom < MIN_ZOOM { MIN_ZOOM / self.zoom } else { self.zoom / MAX_ZOOM };
+            ln_factor * (1.0 - past.ln() / OVERSTRETCH.ln()).clamp(0.0, 1.0) * 0.5
+        } else {
+            ln_factor
+        };
+        self.zoom_to(anchor, self.zoom * l.exp(), MIN_ZOOM / OVERSTRETCH, MAX_ZOOM * OVERSTRETCH);
+    }
+
+    /// Sets zoom (clamped to `lo..=hi`) keeping the world point under `anchor` fixed.
+    fn zoom_to(&mut self, anchor: Point<Pixels>, zoom: f32, lo: f32, hi: f32) {
+        self.view_motion = None;
+        let world = self.transform().to_world(anchor);
+        self.zoom = zoom.clamp(lo, hi);
+        let moved = self.transform().to_screen(world);
+        self.pan = self.pan + (anchor - moved);
+    }
+
+    /// Handles a trackpad pinch event. Speed is smoothed while pinching; on release the zoom
+    /// keeps gliding and slows down, and springs back if it was stretched past a limit.
+    pub fn pinch(&mut self, anchor: Point<Pixels>, delta: f32, phase: TouchPhase, now: Instant) {
+        match phase {
+            TouchPhase::Started => {
+                self.glide = None;
+                self.pinch = Some(Pinch { last: now, velocity: 0.0, anchor });
+            }
+            TouchPhase::Moved => {
+                let l = (1.0 + delta).max(0.05).ln();
+                self.stretch_zoom(anchor, l);
+                let p = self.pinch.get_or_insert(Pinch { last: now, velocity: 0.0, anchor });
+                let dt = (now - p.last).as_secs_f32().max(0.004);
+                p.velocity = 0.6 * (l / dt) + 0.4 * p.velocity;
+                p.last = now;
+                p.anchor = anchor;
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if delta != 0.0 {
+                    self.stretch_zoom(anchor, (1.0 + delta).max(0.05).ln());
+                }
+                let p = self.pinch.take();
+                // Fingers that stopped before lifting don't fling.
+                let velocity = p.as_ref().filter(|p| (now - p.last).as_secs_f32() < 0.08).map_or(0.0, |p| p.velocity);
+                let anchor = p.map_or(anchor, |p| p.anchor);
+                self.glide = Some(ZoomGlide { last: now, velocity: velocity.clamp(-12.0, 12.0), anchor });
+            }
+        }
+    }
+
+    /// Advances momentum and the spring back into the zoom limits. Returns whether zoom is
+    /// still moving.
+    pub fn step_glide(&mut self, now: Instant) -> bool {
+        let Some(g) = &mut self.glide else { return false };
+        let dt = (now - g.last).as_secs_f32().min(0.05);
+        g.last = now;
+        let (anchor, mut velocity) = (g.anchor, g.velocity);
+        velocity *= (-dt / MOMENTUM_DECAY).exp();
+        if velocity.abs() > 0.05 {
+            self.stretch_zoom(anchor, velocity * dt);
+        } else {
+            velocity = 0.0;
+        }
+        // Spring back if past a limit (works together with any remaining momentum).
+        let limit = self.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        let past = (self.zoom / limit).ln();
+        if past.abs() > 1e-4 && velocity * past >= 0.0 {
+            velocity = 0.0;
+        }
+        if past.abs() > 1e-4 {
+            let back = past * (1.0 - (-dt / SPRING).exp());
+            self.zoom_to(anchor, self.zoom * (-back).exp(), MIN_ZOOM / OVERSTRETCH, MAX_ZOOM * OVERSTRETCH);
+        }
+        let settled = velocity == 0.0 && (self.zoom / limit).ln().abs() <= 1e-3;
+        if settled {
+            if self.zoom != limit {
+                self.zoom_to(anchor, limit, MIN_ZOOM, MAX_ZOOM);
+            }
+            self.glide = None;
+            return false;
+        }
+        if let Some(g) = &mut self.glide {
+            g.velocity = velocity;
+        }
+        true
+    }
+
     /// Zooms by `factor`, keeping the world point under `anchor` fixed on screen.
     pub fn zoom_at(&mut self, anchor: Point<Pixels>, factor: f32) {
         self.view_motion = None;
+        self.glide = None;
         let before = self.transform();
         let world = before.to_world(anchor);
-        self.zoom = (self.zoom * factor).clamp(0.3, 40.0);
+        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         let after = self.transform();
         let moved = after.to_screen(world);
         self.pan = self.pan + (anchor - moved);
@@ -923,6 +1043,67 @@ mod tests {
             }
         }
         assert_eq!(s.fit, b);
+    }
+
+    fn pinch_frames(s: &mut MapState, start: Instant, deltas: &[f32]) -> Instant {
+        let anchor = point(px(400.), px(300.));
+        s.pinch(anchor, 0.0, TouchPhase::Started, start);
+        let mut t = start;
+        for d in deltas {
+            t += Duration::from_millis(16);
+            s.pinch(anchor, *d, TouchPhase::Moved, t);
+        }
+        t += Duration::from_millis(16);
+        s.pinch(anchor, 0.0, TouchPhase::Ended, t);
+        t
+    }
+
+    fn run_glide(s: &mut MapState, mut t: Instant) -> Instant {
+        for _ in 0..600 {
+            t += Duration::from_millis(16);
+            if !s.step_glide(t) {
+                break;
+            }
+        }
+        t
+    }
+
+    #[test]
+    fn a_quick_pinch_keeps_gliding_then_stops() {
+        let mut s = MapState::default();
+        s.bounds.set(Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.))));
+        let t = pinch_frames(&mut s, Instant::now(), &[0.05; 6]);
+        let released = s.zoom;
+        assert!(released > 1.3);
+        run_glide(&mut s, t);
+        assert!(s.zoom > released * 1.05, "momentum carried it further: {} → {}", released, s.zoom);
+        assert!(s.glide.is_none(), "and it came to rest");
+    }
+
+    #[test]
+    fn a_pinch_held_still_before_release_does_not_fling() {
+        let mut s = MapState::default();
+        let anchor = point(px(400.), px(300.));
+        let t0 = Instant::now();
+        s.pinch(anchor, 0.0, TouchPhase::Started, t0);
+        s.pinch(anchor, 0.1, TouchPhase::Moved, t0 + Duration::from_millis(16));
+        let z = s.zoom;
+        let t = t0 + Duration::from_millis(400);
+        s.pinch(anchor, 0.0, TouchPhase::Ended, t);
+        run_glide(&mut s, t);
+        assert!((s.zoom - z).abs() < 1e-3);
+    }
+
+    #[test]
+    fn pinching_past_the_limit_resists_and_springs_back() {
+        let mut s = MapState::default();
+        s.zoom = MAX_ZOOM;
+        let t = pinch_frames(&mut s, Instant::now(), &[0.2; 10]);
+        assert!(s.zoom > MAX_ZOOM, "it stretches a little");
+        assert!(s.zoom < MAX_ZOOM * OVERSTRETCH, "but not far: {}", s.zoom);
+        assert!(s.zoom < MAX_ZOOM * 1.2_f32.powi(10), "with resistance");
+        run_glide(&mut s, t);
+        assert!((s.zoom - MAX_ZOOM).abs() < 1e-3, "springs back to the limit: {}", s.zoom);
     }
 
     #[test]

@@ -60,7 +60,8 @@ enum ViewMode {
 
 /// One entry in the search dropdown.
 struct Hit {
-    node: NodeId,
+    /// What opening it does: go to a song or group, or (`None`) keep the query as a map filter.
+    node: Option<NodeId>,
     kind: &'static str,
     name: String,
     detail: String,
@@ -74,6 +75,10 @@ pub(crate) struct Workspace {
     query: trackmap_core::search::Query,
     search_index: Vec<String>,
     search_hit: usize,
+    /// The Quick Open panel (⌘P) is showing; while it is, the map previews its query.
+    quick_open: bool,
+    /// A search kept as a map filter ("Show matching songs on the map").
+    filter: trackmap_core::search::Query,
     library: LibraryState,
     /// Tracks added since the last time this library was open, or while it is open.
     new_tracks: HashSet<PathBuf>,
@@ -204,6 +209,8 @@ impl Workspace {
             query: Default::default(),
             search_index: Vec::new(),
             search_hit: 0,
+            quick_open: false,
+            filter: Default::default(),
             library: LibraryState::Empty,
             new_tracks: HashSet::new(),
             only_new: false,
@@ -711,8 +718,21 @@ impl Workspace {
         };
     }
 
-    fn search_focused(&self, window: &Window, cx: &App) -> bool {
-        self.search.read(cx).focus_handle(cx).is_focused(window)
+    fn open_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quick_open = true;
+        self.search_hit = 0;
+        self.map.picker = None;
+        let handle = self.search.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        // Like VS Code, reopen with the last query selected so typing replaces it.
+        self.search.update(cx, |s, cx| s.select_all_text(cx));
+        cx.notify();
+    }
+
+    fn close_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quick_open = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
     }
 
     /// Best matches for the dropdown: a few songs, then artists, albums, labels and playlists.
@@ -730,19 +750,22 @@ impl Workspace {
             .map(|(i, _)| (q.rank(lib.tracks[i].title.as_deref().unwrap_or("")).unwrap_or(3), i))
             .collect();
         songs.sort_by_key(|&(r, i)| (r, lib.tracks[i].title.clone()));
-        let mut hits: Vec<Hit> = songs
-            .into_iter()
-            .take(6)
-            .map(|(_, i)| {
+        // First: keep the query as a filter on the map.
+        let mut hits = vec![Hit {
+            node: None,
+            kind: "Filter",
+            name: format!("Show {} matching songs on the map", songs.len()),
+            detail: String::new(),
+        }];
+        hits.extend(songs.into_iter().take(8).map(|(_, i)| {
                 let t = &lib.tracks[i];
                 Hit {
-                    node: NodeId::Song(i),
+                    node: Some(NodeId::Song(i)),
                     kind: "Song",
                     name: t.title.clone().unwrap_or_default(),
                     detail: t.artist.clone().unwrap_or_default(),
                 }
-            })
-            .collect();
+            }));
         let groups: [(&'static str, &[String], fn(usize) -> NodeId); 4] = [
             ("Artist", &graph.artists, NodeId::Artist),
             ("Album", &graph.albums, NodeId::Album),
@@ -754,7 +777,7 @@ impl Workspace {
                 names.iter().enumerate().filter_map(|(i, n)| q.rank(n).map(|r| (r, i))).collect();
             found.sort_by_key(|&(r, i)| (r, names[i].to_lowercase()));
             hits.extend(found.into_iter().take(3).map(|(_, i)| Hit {
-                node: make(i),
+                node: Some(make(i)),
                 kind,
                 name: names[i].clone(),
                 detail: format!("{} songs", graph.songs_of(make(i)).len()),
@@ -763,71 +786,129 @@ impl Workspace {
         hits
     }
 
-    /// Opens a search result: a song is selected, a group narrows the map to it.
+    /// Opens a Quick Open result: a song is selected, a group narrows the map to it, and the
+    /// first row keeps the query as a map filter.
     fn open_hit(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let hits = self.search_results();
-        let (Some(hit), Some(graph)) = (hits.get(index), self.graph.clone()) else { return };
-        self.map.select(graph.key(hit.node));
-        window.focus(&self.focus, cx);
-        cx.notify();
+        let Some(hit) = hits.get(index) else { return };
+        match (hit.node, self.graph.clone()) {
+            (None, _) => {
+                self.filter = self.query.clone();
+                self.map.clear();
+            }
+            (Some(node), Some(graph)) => {
+                // Make sure what we jump to isn't hidden by an older filter.
+                self.filter = Default::default();
+                self.map.select(graph.key(node));
+            }
+            _ => {}
+        }
+        self.close_quick_open(window, cx);
     }
 
-    fn clear_search(&mut self, cx: &mut Context<Self>) {
-        self.search.update(cx, |s, cx| s.set_text("", cx));
-    }
-
-    fn search_dropdown(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// The ⌘P panel: a search field with results below, floating at the top centre like VS Code.
+    fn quick_open_view(&self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let t = *t;
         let hits = self.search_results();
         let selected = self.search_hit.min(hits.len().saturating_sub(1));
-        let rows: Vec<AnyElement> = if hits.is_empty() {
-            vec![div().px_3().py_1().text_color(t.text_muted).child("No matches").into_any_element()]
+        let rows: Vec<AnyElement> = if self.query.is_empty() {
+            vec![div()
+                .px_3()
+                .py_2()
+                .text_color(t.text_muted)
+                .child("Type to search songs, artists, albums, labels and playlists")
+                .into_any_element()]
         } else {
             hits.into_iter()
                 .enumerate()
                 .map(|(i, h)| {
+                    let on = i == selected;
                     div()
                         .id(("hit", i))
                         .flex()
+                        .items_center()
                         .gap_2()
                         .px_3()
                         .py_1()
                         .cursor_pointer()
-                        .when(i == selected, |d| d.bg(t.bg_panel))
-                        .hover(|s| s.bg(t.bg_panel))
-                        .child(div().w(px(56.)).text_xs().text_color(t.accent).child(h.kind))
-                        .child(div().flex_1().overflow_hidden().truncate().text_color(t.text).child(h.name))
-                        .child(div().text_xs().text_color(t.text_muted).child(h.detail))
+                        .when(on, |d| d.bg(t.accent).text_color(t.bg_app))
+                        .when(!on, |d| d.hover(|s| s.bg(t.bg_panel)))
+                        .child(
+                            div()
+                                .w(px(60.))
+                                .text_xs()
+                                .text_color(if on { t.bg_app } else { t.accent })
+                                .child(h.kind),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .truncate()
+                                .text_color(if on { t.bg_app } else { t.text })
+                                .child(h.name),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if on { t.bg_app } else { t.text_muted })
+                                .child(h.detail),
+                        )
                         .on_click(cx.listener(move |this, _, window, cx| this.open_hit(i, window, cx)))
                         .into_any_element()
                 })
                 .collect()
         };
-        gpui::deferred(
-            div()
-                .absolute()
-                .top(px(30.))
-                .left_0()
-                .w(px(440.))
-                .py_1()
-                .rounded_lg()
-                .bg(t.bg_elevated)
-                .border_1()
-                .border_color(t.border)
-                .shadow_lg()
-                .occlude()
-                .children(rows)
-                .child(
+        div()
+            .absolute()
+            .size_full()
+            // Clicking outside the panel closes it.
+            .child(
+                div()
+                    .id("quick-open-backdrop")
+                    .absolute()
+                    .size_full()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close_quick_open(window, cx))),
+            )
+            .child(
+                div().absolute().top(px(8.)).left_0().right_0().flex().justify_center().child(
                     div()
-                        .px_3()
-                        .pt_1()
-                        .text_xs()
-                        .text_color(t.text_muted)
-                        .child("↑ ↓ to choose  ·  Enter to open  ·  Esc to clear"),
+                        .id("quick-open")
+                        .w(px(600.))
+                        .max_h(px(460.))
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .bg(t.bg_elevated)
+                        .border_1()
+                        .border_color(t.border)
+                        .shadow_lg()
+                        .occlude()
+                        .child(
+                            div()
+                                .m_2()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(t.bg_app)
+                                .border_1()
+                                .border_color(t.accent)
+                                .child(self.search.clone()),
+                        )
+                        .child(div().id("quick-open-results").pb_1().overflow_y_scroll().children(rows))
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .border_t_1()
+                                .border_color(t.border)
+                                .text_xs()
+                                .text_color(t.text_muted)
+                                .child("↑ ↓ to choose  ·  Enter to open  ·  Esc to close"),
+                        ),
                 ),
-        )
-        .with_priority(1)
-        .into_any_element()
+            )
+            .into_any_element()
     }
 
     fn open_folder(&mut self, cx: &mut Context<Self>) {
@@ -971,7 +1052,7 @@ impl Workspace {
         format!("{} ▾", name.unwrap_or_else(|| path.display().to_string())).into()
     }
 
-    fn top_bar(&self, t: &Theme, searching: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn top_bar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let chip = |label: &'static str| {
             div()
                 .px_2()
@@ -1019,16 +1100,50 @@ impl Workspace {
                     .child(self.library_name()),
             )
             .child(
+                // Like VS Code's command centre: shows the search, opens Quick Open.
                 div()
-                    .relative()
-                    .w(px(280.))
+                    .id("command-center")
+                    .w(px(300.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_2()
+                    .py_0p5()
                     .rounded_md()
+                    .cursor_pointer()
                     .bg(t.bg_elevated)
                     .border_1()
-                    .border_color(if self.query.is_empty() { t.border } else { t.accent })
-                    .child(self.search.clone())
-                    .when(searching, |d| d.child(self.search_dropdown(t, cx))),
+                    .border_color(if self.filter.is_empty() { t.border } else { t.accent })
+                    .hover(|s| s.border_color(t.accent))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_quick_open(window, cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .truncate()
+                            .text_color(if self.filter.is_empty() { t.text_muted } else { t.text })
+                            .child(if self.filter.is_empty() {
+                                "Search tracks, artists, albums…".to_string()
+                            } else {
+                                format!("“{}”  ·  {} songs", self.search.read(cx).text(), self.visible.len())
+                            }),
+                    )
+                    .when(self.filter.is_empty(), |d| d.child(div().text_xs().text_color(t.text_muted).child("⌘P")))
+                    .when(!self.filter.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .id("clear-filter")
+                                .px_1()
+                                .text_color(t.text_muted)
+                                .hover(|s| s.text_color(t.accent))
+                                .child("✕")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.filter = Default::default();
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
             .child(chip("BPM"))
             .child(chip("Key"))
@@ -1986,7 +2101,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *Theme::get(cx);
-        let query = &self.query;
+        let query = if self.quick_open { &self.query } else { &self.filter };
         let index = &self.search_index;
         self.visible = match &self.library {
             LibraryState::Loaded(lib) => (0..lib.tracks.len())
@@ -1995,15 +2110,16 @@ impl Render for Workspace {
                 .collect(),
             _ => Vec::new(),
         };
-        let searching = !self.query.is_empty() && self.search_focused(window, cx);
+
         div()
             .track_focus(&self.focus)
             .key_context("Workspace")
             .on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
-                let handle = this.search.read(cx).focus_handle(cx);
-                window.focus(&handle, cx);
-                this.search.update(cx, |s, cx| s.select_all_text(cx));
-                cx.notify();
+                if this.quick_open {
+                    this.close_quick_open(window, cx);
+                } else {
+                    this.open_quick_open(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &SearchUp, _, cx| {
                 this.search_hit = this.search_hit.saturating_sub(1);
@@ -2027,12 +2143,13 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &Confirm, window, cx| {
                 if this.prompt.is_some() {
                     this.confirm_prompt(window, cx);
-                } else if this.search_focused(window, cx) {
+                } else if this.quick_open {
                     this.open_hit(this.search_hit, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
-                // Esc peels back one layer: prompt, search, picker, song selection, then group.
+                // Esc peels back one layer: prompt, Quick Open, picker, song selection, group,
+                // then a search filter.
                 if this.prompt.is_some() {
                     this.close_prompt(window, cx);
                     return;
@@ -2042,15 +2159,12 @@ impl Render for Workspace {
                     cx.notify();
                     return;
                 }
-                if this.search_focused(window, cx) {
-                    // First Esc clears the search, the next leaves the box.
-                    if this.query.is_empty() {
-                        window.focus(&this.focus, cx);
-                    } else {
-                        this.clear_search(cx);
-                    }
+                if this.quick_open {
+                    this.close_quick_open(window, cx);
                 } else if this.map.picker.is_some() {
                     this.map.picker = None;
+                } else if this.map.selected.is_none() && this.map.scope.is_none() && !this.filter.is_empty() {
+                    this.filter = Default::default();
                 } else {
                     this.map.back();
                 }
@@ -2062,11 +2176,12 @@ impl Render for Workspace {
             .flex_col()
             .bg(t.bg_app)
             .text_sm()
-            .child(self.top_bar(&t, searching, cx))
+            .child(self.top_bar(&t, cx))
             .child(self.canvas_area(&t, window, cx))
             .child(self.preview_bar(&t, cx))
             .children(self.prompt.as_ref().map(|p| self.prompt_view(p, &t)))
             .children(self.sync_view(&t, cx))
+            .when(self.quick_open, |d| d.child(self.quick_open_view(&t, cx)))
     }
 }
 

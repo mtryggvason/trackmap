@@ -116,11 +116,14 @@ highlights its songs and dims the rest; they never appear as nodes.
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Search** (done): the top-bar box filters the map live (title, artist, album, label, genre,
-  file name; every word must match, any order, accents ignored) and the view refits. **⌘P**
-  focuses it; the dropdown lists songs, artists, albums, labels and playlists (↑ ↓, Enter to
-  open, Esc clears then leaves). Each track's search text is prepared once, so a keystroke
-  scans 20,000 tracks in under 1 ms.
+- **Search** (done): **⌘P** opens a VS Code-style Quick Open panel at the top centre: type to
+  search songs, artists, albums, labels and playlists (every word must match, any order,
+  accents ignored); the map previews matches while it's open. Enter opens a result (song
+  selected, group narrows the map); the first row, "Show N matching songs on the map", keeps
+  the query as a map filter. Esc / clicking outside closes and restores the map. The top-bar
+  box works like VS Code's command centre: it opens Quick Open and shows an active filter
+  with ✕. Each track's search text is prepared once, so a keystroke scans 20,000 tracks in
+  under 1 ms.
 - Later: a `>` command mode for actions (new playlist, sync, open folder, …).
 - The sync button has a status dot: orange means there are unsynced changes.
 

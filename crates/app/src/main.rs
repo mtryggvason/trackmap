@@ -1,6 +1,7 @@
 mod input;
 mod map;
 mod player;
+mod sync_ui;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
@@ -44,7 +45,7 @@ struct NamePrompt {
     input: gpui::Entity<input::TextInput>,
 }
 
-enum LibraryState {
+pub(crate) enum LibraryState {
     Empty,
     Scanning(PathBuf),
     Loaded(Library),
@@ -63,7 +64,7 @@ enum PaletteMode {
     Commands,
 }
 
-struct Workspace {
+pub(crate) struct Workspace {
     focus: FocusHandle,
     palette: Option<PaletteMode>,
     library: LibraryState,
@@ -101,6 +102,8 @@ struct Workspace {
     adding_to_playlist: bool,
     /// A playlist whose Delete button was clicked once and awaits confirmation.
     confirm_delete: Option<String>,
+    /// The Sync to USB dialog, when open.
+    sync: Option<sync_ui::SyncDialog>,
 }
 
 /// What a "Process …" button analyses.
@@ -171,7 +174,7 @@ fn decode_thumb(path: &std::path::Path) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
 }
 
-fn settings_path() -> Option<PathBuf> {
+pub(crate) fn settings_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("TrackMap").join("settings.json"))
 }
 
@@ -203,6 +206,7 @@ impl Workspace {
             prompt: None,
             adding_to_playlist: false,
             confirm_delete: None,
+            sync: None,
         }
     }
 
@@ -943,13 +947,16 @@ impl Workspace {
             .children(self.process_buttons(t, cx))
             .child(
                 div()
+                    .id("sync-open")
                     .px_3()
                     .py_0p5()
                     .rounded_md()
+                    .cursor_pointer()
                     .bg(t.accent)
                     .hover(|s| s.bg(t.accent_hover))
                     .text_color(t.bg_app)
-                    .child("Sync ⇪"),
+                    .child("Sync ⇪")
+                    .on_click(cx.listener(|this, _, _, cx| this.open_sync(cx))),
             )
     }
 
@@ -1887,6 +1894,11 @@ impl Render for Workspace {
                     this.close_prompt(window, cx);
                     return;
                 }
+                if this.sync.as_ref().is_some_and(|d| d.running.is_none()) {
+                    this.sync = None;
+                    cx.notify();
+                    return;
+                }
                 if this.palette.is_some() {
                     this.palette = None;
                 } else if this.map.picker.is_some() {
@@ -1907,6 +1919,7 @@ impl Render for Workspace {
             .child(self.preview_bar(&t, cx))
             .children(self.palette.map(|m| self.palette(m, &t)))
             .children(self.prompt.as_ref().map(|p| self.prompt_view(p, &t)))
+            .children(self.sync_view(&t, cx))
     }
 }
 

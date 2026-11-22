@@ -1,4 +1,5 @@
-//! Prints detected BPM and key (and the tagged values, if any) for audio files, with timing.
+//! Prints detected BPM and key (and the tagged values, if any) for audio files, with timing,
+//! and how long a waveform takes.
 //!
 //!     cargo run -p trackmap-core --example analyze -- file1.mp3 file2.wav …
 
@@ -13,6 +14,7 @@ fn main() {
         let bpm_ms = t.elapsed().as_millis();
         let t = Instant::now();
         let key = trackmap_core::key_detect::detect_file(path);
+        let key_ms = t.elapsed().as_millis();
         let t = Instant::now();
         let wave = trackmap_core::waveform::compute(path);
         eprintln!("waveform: {} bins in {} ms", wave.map_or(0, |w| w.len()), t.elapsed().as_millis());
@@ -24,7 +26,7 @@ fn main() {
             bpm_ms,
             show(key.map(|k| k.to_string())),
             show(tagged.key.map(|k| k.to_string())),
-            t.elapsed().as_millis(),
+            key_ms,
             path.file_name().unwrap().to_string_lossy()
         );
     }

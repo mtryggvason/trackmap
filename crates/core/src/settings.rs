@@ -1,5 +1,6 @@
 //! App-wide settings, stored as JSON. The app decides where the file lives.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -11,6 +12,10 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     /// The library opened most recently; reopened on launch.
     pub last_library: Option<PathBuf>,
+    /// The drive each library was last synced to, by library root.
+    pub sync_targets: BTreeMap<PathBuf, PathBuf>,
+    /// Whether the last sync was whole-library or playlists-only.
+    pub sync_scope: crate::sync::Scope,
 }
 
 impl Settings {
@@ -42,11 +47,17 @@ mod tests {
         let path = dir.path().join("nested/settings.json");
         assert_eq!(Settings::load(&path), Settings::default());
 
-        let s = Settings { last_library: Some("/Music".into()) };
+        let mut s = Settings { last_library: Some("/Music".into()), ..Default::default() };
+        s.sync_targets.insert("/Music".into(), "/Volumes/USB".into());
+        s.sync_scope = crate::sync::Scope::PlaylistsOnly;
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path), s);
 
         fs::write(&path, b"garbage").unwrap();
         assert_eq!(Settings::load(&path), Settings::default());
+
+        // Settings files from before sync existed still load.
+        fs::write(&path, br#"{"last_library":"/Old"}"#).unwrap();
+        assert_eq!(Settings::load(&path).last_library, Some("/Old".into()));
     }
 }

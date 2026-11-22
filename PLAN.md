@@ -29,7 +29,12 @@ with a BOM, header row `#  Track Title  Artist  …  BPM  Key …`, and files at
   skips `Playlists/` so tracks aren't counted twice.
 - **`<root>/.trackmap/library.db`**: SQLite cache of tags, analysis and waveform peaks, keyed by
   path + content hash so moves and renames keep their data.
-- **Sync to USB**: writes the layout the player expects.
+- **Sync to USB** (done): writes the layout the player expects, onto an existing Rekordbox USB
+  without disturbing it. A manifest on the drive (`.trackmap-sync.json`) records every file
+  TrackMap wrote; only those are ever updated or removed. Identical files already there are
+  reused; different files in the way are never touched (the track gets another name). Atomic
+  copies, resumable, FAT32/exFAT-safe names, no `._` files, AAC skipped. Preview before
+  copying; whole library or playlist tracks only; removing deleted tracks is opt-in.
   ```
   USB/
     Contents/<Artist>/<Album>/<file>   each track copied once, incremental

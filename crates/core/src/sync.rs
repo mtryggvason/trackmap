@@ -182,6 +182,13 @@ fn same_file(a: &Path, b: &Path) -> bool {
     read(a, false).is_some_and(|x| read(b, false) == Some(x)) && read(a, true).is_some_and(|x| read(b, true) == Some(x))
 }
 
+/// Whether a file is really MP4/AAC audio (an `ftyp` box) whatever its extension says. The
+/// player can't play AAC, so such files are skipped with an explanation.
+fn is_aac(path: &Path) -> bool {
+    let mut head = [0u8; 8];
+    fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head[4..8] == b"ftyp"
+}
+
 /// Works out what a sync would do. Reads the drive but changes nothing.
 pub fn plan(lib: &Library, playlists: &[Playlist], scope: Scope, drive: &Path, remove_unwanted: bool) -> Plan {
     let manifest = Manifest::load(drive);
@@ -207,6 +214,10 @@ pub fn plan(lib: &Library, playlists: &[Playlist], scope: Scope, drive: &Path, r
         let rel = t.path.strip_prefix(&lib.root).unwrap_or(&t.path).to_string_lossy().replace('\\', "/");
         if fat32 && t.size > FAT32_MAX {
             plan.skipped.push((t.path.clone(), "larger than 4 GB (FAT32 limit)".into()));
+            continue;
+        }
+        if is_aac(&t.path) {
+            plan.skipped.push((t.path.clone(), "it's AAC (M4A) audio, which the player can't play".into()));
             continue;
         }
         // Already ours from an earlier sync?
@@ -688,6 +699,19 @@ mod tests {
         }).collect();
         assert_eq!(dests.len(), 2);
         assert_ne!(dests[0].to_lowercase(), dests[1].to_lowercase());
+    }
+
+    #[test]
+    fn aac_disguised_as_mp3_is_skipped() {
+        let s = setup();
+        let mut lib = s.lib.clone();
+        let mut fake = b"\x00\x00\x00\x20ftypM4A ".to_vec();
+        fake.extend_from_slice(&[0; 64]);
+        lib.tracks.push(track(&lib.root, "Go Deep.mp3", "MAW", "", &fake));
+        let plan = plan(&lib, &[], Scope::WholeLibrary, &s.drive, false);
+        assert_eq!(plan.copies(), 3);
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(plan.skipped[0].1.contains("AAC"));
     }
 
     #[test]

@@ -1,12 +1,24 @@
 mod theme;
 
+use std::ops::Range;
+use std::path::PathBuf;
+
 use gpui::{
-    actions, div, point, prelude::*, px, size, App, Application, Bounds, Context, FocusHandle,
-    KeyBinding, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    actions, div, point, prelude::*, px, size, uniform_list, App, Application, Bounds, Context,
+    FocusHandle, KeyBinding, PathPromptOptions, SharedString, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
+use napworks_core::Library;
 use theme::Theme;
 
-actions!(napworks, [QuickOpen, CommandPalette, Dismiss, Quit]);
+actions!(napworks, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
+
+enum LibraryState {
+    Empty,
+    Scanning(PathBuf),
+    Loaded(Library),
+    Failed(PathBuf, String),
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum PaletteMode {
@@ -17,14 +29,63 @@ enum PaletteMode {
 struct Workspace {
     focus: FocusHandle,
     palette: Option<PaletteMode>,
+    library: LibraryState,
 }
 
 impl Workspace {
     fn new(cx: &mut Context<Self>) -> Self {
-        Self { focus: cx.focus_handle(), palette: None }
+        Self { focus: cx.focus_handle(), palette: None, library: LibraryState::Empty }
     }
 
-    fn top_bar(&self, t: &Theme) -> impl IntoElement {
+    fn open_folder(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open library".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(mut paths))) = picked.await else { return };
+            let Some(root) = paths.pop() else { return };
+            this.update(cx, |ws, cx| ws.load(root, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Scans `root` on a background thread and shows the result.
+    fn load(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.library = LibraryState::Scanning(root.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let scan_root = root.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { napworks_core::scan(&scan_root) })
+                .await;
+
+            this.update(cx, |ws, cx| {
+                ws.library = match result {
+                    Ok(lib) => LibraryState::Loaded(lib),
+                    Err(e) => LibraryState::Failed(root, e.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn library_name(&self) -> SharedString {
+        let path = match &self.library {
+            LibraryState::Empty => return "Open folder… ▾".into(),
+            LibraryState::Scanning(p) | LibraryState::Failed(p, _) => p,
+            LibraryState::Loaded(lib) => &lib.root,
+        };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        format!("{} ▾", name.unwrap_or_else(|| path.display().to_string())).into()
+    }
+
+    fn top_bar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let chip = |label: &'static str| {
             div()
                 .px_2()
@@ -45,7 +106,18 @@ impl Workspace {
             .bg(t.bg_panel)
             .border_b_1()
             .border_color(t.border)
-            .child(div().text_color(t.text).child("No library ▾"))
+            .child(
+                div()
+                    .id("library")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(t.text)
+                    .hover(|s| s.bg(t.bg_elevated))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_folder(cx)))
+                    .child(self.library_name()),
+            )
             .child(
                 div()
                     .w(px(280.))
@@ -76,15 +148,104 @@ impl Workspace {
             )
     }
 
-    fn canvas_area(&self, t: &Theme) -> impl IntoElement {
+    fn canvas_area(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let centered = |text: SharedString| {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(t.text_muted)
+                .child(text)
+        };
+        let body = match &self.library {
+            LibraryState::Empty => {
+                centered("Open a folder to start (⌘O)  ·  ⌘P to search".into()).into_any_element()
+            }
+            LibraryState::Scanning(p) => {
+                centered(format!("Scanning {}…", p.display()).into()).into_any_element()
+            }
+            LibraryState::Failed(p, e) => {
+                centered(format!("Could not open {}: {e}", p.display()).into()).into_any_element()
+            }
+            LibraryState::Loaded(lib) => self.track_list(lib, t, cx).into_any_element(),
+        };
+        div().flex_1().flex().flex_col().bg(t.bg_app).child(body)
+    }
+
+    /// Temporary flat list until the graph canvas lands (milestone 5).
+    fn track_list(&self, lib: &Library, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *t;
+        let summary = format!(
+            "{} tracks  ·  {} artists  ·  {} labels",
+            lib.tracks.len(),
+            lib.artist_count(),
+            lib.label_count()
+        );
         div()
             .flex_1()
             .flex()
-            .items_center()
-            .justify_center()
-            .bg(t.bg_app)
-            .text_color(t.text_muted)
-            .child("Open a folder to start  ·  ⌘P to search")
+            .flex_col()
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_color(t.text_muted)
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(summary),
+            )
+            .child(
+                uniform_list(
+                    "tracks",
+                    lib.tracks.len(),
+                    cx.processor(move |this, range: Range<usize>, _, _| {
+                        let LibraryState::Loaded(lib) = &this.library else { return Vec::new() };
+                        range
+                            .map(|i| {
+                                let tr = &lib.tracks[i];
+                                let dash = || "—".to_string();
+                                div()
+                                    .id(i)
+                                    .flex()
+                                    .gap_3()
+                                    .px_3()
+                                    .h(px(26.))
+                                    .items_center()
+                                    .hover(|s| s.bg(t.bg_elevated))
+                                    .child(
+                                        div()
+                                            .w(px(360.))
+                                            .overflow_hidden()
+                                            .text_color(t.text)
+                                            .child(tr.title.clone().unwrap_or_else(dash)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(220.))
+                                            .overflow_hidden()
+                                            .text_color(t.text_muted)
+                                            .child(tr.artist.clone().unwrap_or_else(dash)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(180.))
+                                            .overflow_hidden()
+                                            .text_color(t.text_muted)
+                                            .child(tr.label.clone().unwrap_or_else(dash)),
+                                    )
+                                    .child(div().w(px(60.)).text_color(t.text_muted).child(
+                                        tr.bpm.map(|b| format!("{b:.0}")).unwrap_or_else(dash),
+                                    ))
+                                    .child(div().w(px(40.)).text_color(t.accent).child(
+                                        tr.key.map(|k| k.to_string()).unwrap_or_default(),
+                                    ))
+                            })
+                            .collect()
+                    }),
+                )
+                .flex_1(),
+            )
     }
 
     fn preview_bar(&self, t: &Theme) -> impl IntoElement {
@@ -105,7 +266,7 @@ impl Workspace {
     fn palette(&self, mode: PaletteMode, t: &Theme) -> impl IntoElement {
         let placeholder: SharedString = match mode {
             PaletteMode::QuickOpen => "Search songs, artists, labels, playlists…  (type > for commands)",
-            PaletteMode::Commands => "> New playlist · Sync to USB · Open folder…",
+            PaletteMode::Commands => "> New playlist · Sync to USB · Open folder… (⌘O)",
         }
         .into();
         // Full-window overlay with the palette anchored near the top, like VS Code.
@@ -147,6 +308,7 @@ impl Render for Workspace {
                 this.palette = Some(PaletteMode::Commands);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.open_folder(cx)))
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
                 this.palette = None;
                 cx.notify();
@@ -157,8 +319,8 @@ impl Render for Workspace {
             .flex_col()
             .bg(t.bg_app)
             .text_sm()
-            .child(self.top_bar(&t))
-            .child(self.canvas_area(&t))
+            .child(self.top_bar(&t, cx))
+            .child(self.canvas_area(&t, cx))
             .child(self.preview_bar(&t))
             .children(self.palette.map(|m| self.palette(m, &t)))
     }
@@ -170,6 +332,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-p", QuickOpen, None),
             KeyBinding::new("cmd-shift-p", CommandPalette, None),
+            KeyBinding::new("cmd-o", OpenFolder, None),
             KeyBinding::new("escape", Dismiss, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
@@ -187,7 +350,16 @@ fn main() {
                     }),
                     ..Default::default()
                 },
-                |_, cx| cx.new(Workspace::new),
+                |_, cx| {
+                    cx.new(|cx| {
+                        let mut ws = Workspace::new(cx);
+                        // `napworks <folder>` opens that folder straight away.
+                        if let Some(root) = std::env::args_os().nth(1) {
+                            ws.load(PathBuf::from(root), cx);
+                        }
+                        ws
+                    })
+                },
             )
             .expect("failed to open window");
 

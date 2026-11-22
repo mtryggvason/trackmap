@@ -14,7 +14,8 @@ use crate::{Library, Track};
 
 pub const CACHE_DIR: &str = ".trackmap";
 const CACHE_FILE: &str = "library.json";
-const VERSION: u32 = 1;
+// Bump when cached analysis should be redone (e.g. the decoder learned new formats).
+const VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct CacheFile {

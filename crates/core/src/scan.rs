@@ -39,6 +39,17 @@ impl Library {
         }
     }
 
+    /// Records key analysis results. Tracks that have since disappeared are ignored.
+    pub fn set_key(&mut self, results: Vec<(PathBuf, Option<crate::Camelot>)>) {
+        let mut by_path: HashMap<PathBuf, Option<crate::Camelot>> = results.into_iter().collect();
+        for t in &mut self.tracks {
+            if let Some(key) = by_path.remove(&t.path) {
+                t.detected_key = key;
+                t.key_analyzed = true;
+            }
+        }
+    }
+
     pub fn artist_count(&self) -> usize {
         distinct(self.tracks.iter().filter_map(|t| t.artist.as_deref()))
     }

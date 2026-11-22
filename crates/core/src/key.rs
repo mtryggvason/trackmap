@@ -27,6 +27,28 @@ impl Camelot {
         }
     }
 
+    /// The key with this tonic (pitch class, C = 0) and mode.
+    pub fn from_pitch_class(pc: u8, minor: bool) -> Self {
+        let pc = (pc % 12) as usize;
+        let idx = if minor { (pc + 3) % 12 } else { pc };
+        Self { number: MAJOR_CAMELOT[idx], minor }
+    }
+
+    /// Tonic pitch class (C = 0).
+    pub fn pitch_class(self) -> u8 {
+        let idx = MAJOR_CAMELOT.iter().position(|&n| n == self.number).unwrap() as u8;
+        if self.minor { (idx + 9) % 12 } else { idx }
+    }
+
+    /// Musical name as the ID3 key field expects: "Am", "F#m", "Db" (max three characters).
+    pub fn musical_name(self) -> String {
+        const NAMES: [&str; 12] = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"];
+        const MINOR_NAMES: [&str; 12] =
+            ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "Bb", "B"];
+        let pc = self.pitch_class() as usize;
+        if self.minor { format!("{}m", MINOR_NAMES[pc]) } else { NAMES[pc].to_string() }
+    }
+
     /// Angle on the wheel in radians, with 12 at the top and going clockwise.
     pub fn angle(self) -> f32 {
         let step = std::f32::consts::TAU / 12.0;
@@ -121,6 +143,23 @@ mod tests {
         assert_eq!(k("12a").to_string(), "12A");
         assert!("13A".parse::<Camelot>().is_err());
         assert!("H".parse::<Camelot>().is_err());
+    }
+
+    #[test]
+    fn pitch_classes_and_names_round_trip() {
+        for n in 1..=12 {
+            for minor in [true, false] {
+                let c = Camelot::new(n, minor).unwrap();
+                assert_eq!(Camelot::from_pitch_class(c.pitch_class(), minor), c);
+                assert_eq!(c.musical_name().parse::<Camelot>().unwrap(), c, "{}", c.musical_name());
+                assert!(c.musical_name().len() <= 3);
+            }
+        }
+        assert_eq!(k("8A").musical_name(), "Am");
+        assert_eq!(k("8B").musical_name(), "C");
+        assert_eq!(k("11A").musical_name(), "F#m");
+        assert_eq!(k("3B").musical_name(), "Db");
+        assert_eq!(Camelot::from_pitch_class(9, true), k("8A"));
     }
 
     #[test]

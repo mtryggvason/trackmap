@@ -21,7 +21,8 @@ use map::{Frame, MapState, Picker};
 use theme::Theme;
 use trackmap_core::settings::Settings;
 use trackmap_core::{
-    artwork, playlists, tags, tempo, Art, Library, Playlist, Watcher, PLAYLISTS_DIR,
+    artwork, key_detect, playlists, tags, tempo, Art, Camelot, Library, Playlist, Watcher,
+    PLAYLISTS_DIR,
 };
 use trackmap_graph::{Graph, NodeId};
 
@@ -65,32 +66,64 @@ struct Workspace {
     /// Decoded cover thumbnails by file name.
     art_images: HashMap<String, Arc<RenderImage>>,
     art_running: bool,
-    tempo_job: Option<TempoJob>,
-    /// Writing detected BPMs into files' tags.
+    analysis: Option<AnalysisJob>,
+    /// Writing detected BPMs/keys into files' tags.
     writing_tags: bool,
     /// Result of the last tag write, shown on the map.
     notice: Option<SharedString>,
 }
 
-/// A running "Process BPM" pass.
-struct TempoJob {
+/// What a "Process …" button analyses.
+#[derive(Clone, Copy, PartialEq)]
+enum Analysis {
+    Bpm,
+    Key,
+}
+
+impl Analysis {
+    fn label(self) -> &'static str {
+        match self {
+            Analysis::Bpm => "BPM",
+            Analysis::Key => "Key",
+        }
+    }
+
+    fn pending(self, lib: &Library) -> Vec<PathBuf> {
+        match self {
+            Analysis::Bpm => tempo::pending(&lib.tracks),
+            Analysis::Key => key_detect::pending(&lib.tracks),
+        }
+    }
+}
+
+/// A running analysis pass.
+struct AnalysisJob {
+    kind: Analysis,
     done: usize,
     total: usize,
     cancel: Arc<AtomicBool>,
 }
 
-/// Analyses tracks in parallel on a few threads. Returns (path, detected BPM) pairs.
-fn detect_tempos(paths: Vec<PathBuf>) -> Vec<(PathBuf, Option<f32>)> {
-    let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 6);
-    let chunk = paths.len().div_ceil(threads).max(1);
+enum Detected {
+    Bpm(Option<f32>),
+    Key(Option<Camelot>),
+}
+
+fn analysis_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 6)
+}
+
+/// Analyses tracks in parallel on a few threads.
+fn detect_batch(kind: Analysis, paths: Vec<PathBuf>) -> Vec<(PathBuf, Detected)> {
+    let chunk = paths.len().div_ceil(analysis_threads()).max(1);
+    let run = move |p: &PathBuf| match kind {
+        Analysis::Bpm => Detected::Bpm(tempo::detect_file(p)),
+        Analysis::Key => Detected::Key(key_detect::detect_file(p)),
+    };
     std::thread::scope(|s| {
         let handles: Vec<_> = paths
             .chunks(chunk)
-            .map(|c| {
-                s.spawn(move || {
-                    c.iter().map(|p| (p.clone(), tempo::detect_file(p))).collect::<Vec<_>>()
-                })
-            })
+            .map(|c| s.spawn(move || c.iter().map(|p| (p.clone(), run(p))).collect::<Vec<_>>()))
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
     })
@@ -129,24 +162,24 @@ impl Workspace {
             view: ViewMode::Map,
             art_images: HashMap::new(),
             art_running: false,
-            tempo_job: None,
+            analysis: None,
             writing_tags: false,
             notice: None,
         }
     }
 
-    /// Writes every detected BPM into its file's tags so the Pocket can sort by it.
-    fn write_bpm_tags(&mut self, cx: &mut Context<Self>) {
+    /// Writes every detected BPM and key into its file's tags so the Pocket can sort by them.
+    fn write_tags(&mut self, cx: &mut Context<Self>) {
         if self.writing_tags {
             return;
         }
         let LibraryState::Loaded(lib) = &self.library else { return };
-        let todo = tags::bpm_to_write(&lib.tracks);
+        let todo = tags::pending_writes(&lib.tracks);
         if todo.is_empty() {
             return;
         }
         self.writing_tags = true;
-        self.notice = Some(format!("Writing BPM to {} files…", todo.len()).into());
+        self.notice = Some(format!("Writing tags to {} files…", todo.len()).into());
         let generation = self.generation;
         cx.notify();
 
@@ -155,9 +188,9 @@ impl Workspace {
                 .background_executor()
                 .spawn(async move {
                     todo.into_iter()
-                        .map(|(p, bpm)| {
-                            let r = tags::write_bpm(&p, bpm).map_err(|e| e.to_string());
-                            (p, bpm, r)
+                        .map(|w| {
+                            let r = tags::write(&w).map_err(|e| e.to_string());
+                            (w, r)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -168,26 +201,35 @@ impl Workspace {
                     return None;
                 }
                 let LibraryState::Loaded(lib) = &mut ws.library else { return None };
-                let failed: Vec<_> = results.iter().filter(|r| r.2.is_err()).collect();
-                let written = results.len() - failed.len();
+                let written: HashMap<&PathBuf, &tags::TagWrite> =
+                    results.iter().filter(|r| r.1.is_ok()).map(|(w, _)| (&w.path, w)).collect();
                 // Reflect the new tags right away; the watcher will re-read the files too.
-                let ok: HashMap<&PathBuf, f32> = results
-                    .iter()
-                    .filter(|r| r.2.is_ok())
-                    .map(|(p, bpm, _)| (p, bpm.round()))
-                    .collect();
                 for t in &mut lib.tracks {
-                    if let Some(bpm) = ok.get(&t.path) {
-                        t.bpm = Some(*bpm);
+                    if let Some(w) = written.get(&t.path) {
+                        if let Some(bpm) = w.bpm {
+                            t.bpm = Some(bpm.round());
+                        }
+                        if let Some(key) = w.key {
+                            t.key = Some(key);
+                        }
                     }
                 }
-                for (p, _, r) in &failed {
-                    eprintln!("trackmap: could not write BPM to {}: {}", p.display(), r.as_ref().unwrap_err());
+                let failed = results.len() - written.len();
+                let dropped = results
+                    .iter()
+                    .filter(|r| matches!(r.1, Ok(tags::Written::DroppedOwnership)))
+                    .count();
+                for (w, r) in results.iter().filter(|r| r.1.is_err()) {
+                    eprintln!("trackmap: could not write tags to {}: {}", w.path.display(), r.as_ref().unwrap_err());
                 }
-                ws.notice = Some(match failed.len() {
-                    0 => format!("Wrote BPM to {written} files").into(),
-                    n => format!("Wrote BPM to {written} files, {n} failed").into(),
-                });
+                let mut notice = format!("Wrote tags to {} files", written.len());
+                if dropped > 0 {
+                    notice += &format!(" ({dropped} had their store receipt (OWNE) removed to allow it)");
+                }
+                if failed > 0 {
+                    notice += &format!(", {failed} failed");
+                }
+                ws.notice = Some(notice.into());
                 let snapshot = lib.clone();
                 ws.rebuild_graph();
                 cx.notify();
@@ -204,38 +246,47 @@ impl Workspace {
         .detach();
     }
 
-    /// Detects BPM for every track without one, a few at a time, updating the map as it goes.
-    fn start_tempo(&mut self, cx: &mut Context<Self>) {
-        if self.tempo_job.is_some() {
+    /// Analyses every track missing a BPM or key, a few at a time, updating the map as it goes.
+    /// One pass runs at a time.
+    fn start_analysis(&mut self, kind: Analysis, cx: &mut Context<Self>) {
+        if self.analysis.is_some() {
             return;
         }
         let LibraryState::Loaded(lib) = &self.library else { return };
-        let todo = tempo::pending(&lib.tracks);
+        let todo = kind.pending(lib);
         if todo.is_empty() {
             return;
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        self.tempo_job = Some(TempoJob { done: 0, total: todo.len(), cancel: cancel.clone() });
+        self.analysis =
+            Some(AnalysisJob { kind, done: 0, total: todo.len(), cancel: cancel.clone() });
         let generation = self.generation;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let batch = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 6) * 2;
-            for chunk in todo.chunks(batch) {
+            for chunk in todo.chunks(analysis_threads() * 2) {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
                 let paths = chunk.to_vec();
                 let results =
-                    cx.background_executor().spawn(async move { detect_tempos(paths) }).await;
+                    cx.background_executor().spawn(async move { detect_batch(kind, paths) }).await;
                 let keep_going = this.update(cx, |ws, cx| {
                     if ws.generation != generation {
                         return false;
                     }
                     let LibraryState::Loaded(lib) = &mut ws.library else { return false };
                     let n = results.len();
-                    lib.set_tempo(results);
-                    if let Some(job) = &mut ws.tempo_job {
+                    let (mut bpms, mut keys) = (Vec::new(), Vec::new());
+                    for (p, d) in results {
+                        match d {
+                            Detected::Bpm(b) => bpms.push((p, b)),
+                            Detected::Key(k) => keys.push((p, k)),
+                        }
+                    }
+                    lib.set_tempo(bpms);
+                    lib.set_key(keys);
+                    if let Some(job) = &mut ws.analysis {
                         job.done += n;
                     }
                     ws.rebuild_graph();
@@ -247,7 +298,7 @@ impl Workspace {
                 }
             }
             let snapshot = this.update(cx, |ws, cx| {
-                ws.tempo_job = None;
+                ws.analysis = None;
                 cx.notify();
                 match &ws.library {
                     LibraryState::Loaded(lib) if ws.generation == generation => Some(lib.clone()),
@@ -265,8 +316,8 @@ impl Workspace {
         .detach();
     }
 
-    fn stop_tempo(&mut self) {
-        if let Some(job) = self.tempo_job.take() {
+    fn stop_analysis(&mut self) {
+        if let Some(job) = self.analysis.take() {
             job.cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -409,7 +460,7 @@ impl Workspace {
         self.map = MapState::default();
         self.art_images.clear();
         self.art_running = false;
-        self.stop_tempo();
+        self.stop_analysis();
         self.library = LibraryState::Scanning(root.clone());
         cx.notify();
 
@@ -642,7 +693,7 @@ impl Workspace {
                         ),
                     ),
             )
-            .children(self.process_button(t, cx))
+            .children(self.process_buttons(t, cx))
             .child(
                 div()
                     .px_3()
@@ -655,49 +706,61 @@ impl Workspace {
             )
     }
 
-    /// "Process BPM (n)" while tracks lack a tempo; progress (click to stop) while running.
-    fn process_button(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let base = div()
-            .id("process")
-            .px_3()
-            .py_0p5()
-            .rounded_md()
-            .cursor_pointer()
-            .border_1()
-            .border_color(t.accent);
-        if let Some(job) = &self.tempo_job {
-            return Some(
-                base.text_color(t.accent)
-                    .child(format!("Processing {}/{}  ✕", job.done, job.total))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.stop_tempo();
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
+    /// "Process BPM (n)" / "Process Key (n)" while tracks lack them, progress (click to stop)
+    /// while one runs, and "Write to tags (n)" once there are detected values to save.
+    fn process_buttons(&self, t: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let t = *t;
+        let base = move |id: &'static str| {
+            div()
+                .id(id)
+                .px_3()
+                .py_0p5()
+                .rounded_md()
+                .cursor_pointer()
+                .border_1()
+                .border_color(t.accent)
+        };
+        if let Some(job) = &self.analysis {
+            return vec![base("process")
+                .text_color(t.accent)
+                .child(format!("Processing {} {}/{}  ✕", job.kind.label(), job.done, job.total))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.stop_analysis();
+                    cx.notify();
+                }))
+                .into_any_element()];
         }
-        let LibraryState::Loaded(lib) = &self.library else { return None };
-        let n = tempo::pending(&lib.tracks).len();
-        if n > 0 {
-            return Some(
-                base.text_color(t.text)
-                    .hover(|s| s.bg(t.bg_elevated))
-                    .child(format!("Process BPM ({n})"))
-                    .on_click(cx.listener(|this, _, _, cx| this.start_tempo(cx)))
-                    .into_any_element(),
-            );
+        let LibraryState::Loaded(lib) = &self.library else { return Vec::new() };
+        let mut out = Vec::new();
+        for (kind, id) in [(Analysis::Bpm, "process-bpm"), (Analysis::Key, "process-key")] {
+            let n = kind.pending(lib).len();
+            if n > 0 {
+                out.push(
+                    base(id)
+                        .text_color(t.text)
+                        .hover(|s| s.bg(t.bg_elevated))
+                        .child(format!("Process {} ({n})", kind.label()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.start_analysis(kind, cx)))
+                        .into_any_element(),
+                );
+            }
         }
-        let w = tags::bpm_to_write(&lib.tracks).len();
         if self.writing_tags {
-            return Some(base.text_color(t.text_muted).child("Writing BPM…").into_any_element());
+            out.push(base("write-tags").text_color(t.text_muted).child("Writing tags…").into_any_element());
+        } else {
+            let w = tags::pending_writes(&lib.tracks).len();
+            if w > 0 {
+                out.push(
+                    base("write-tags")
+                        .text_color(t.text)
+                        .hover(|s| s.bg(t.bg_elevated))
+                        .child(format!("Write to tags ({w})"))
+                        .on_click(cx.listener(|this, _, _, cx| this.write_tags(cx)))
+                        .into_any_element(),
+                );
+            }
         }
-        (w > 0).then(|| {
-            base.text_color(t.text)
-                .hover(|s| s.bg(t.bg_elevated))
-                .child(format!("Write BPM to tags ({w})"))
-                .on_click(cx.listener(|this, _, _, cx| this.write_bpm_tags(cx)))
-                .into_any_element()
-        })
+        out
     }
 
     fn canvas_area(&mut self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -815,7 +878,7 @@ impl Workspace {
                                         tr.tempo().map(|b| format!("{b:.0}")).unwrap_or_else(dash),
                                     ))
                                     .child(div().w(px(40.)).text_color(t.accent).child(
-                                        tr.key.map(|k| k.to_string()).unwrap_or_default(),
+                                        tr.best_key().map(|k| k.to_string()).unwrap_or_default(),
                                     ))
                             })
                             .collect()
@@ -829,7 +892,7 @@ impl Workspace {
         let (Some(graph), LibraryState::Loaded(lib)) = (self.graph.clone(), &self.library) else {
             return div().into_any_element();
         };
-        let keys: Vec<_> = lib.tracks.iter().map(|tr| tr.key).collect();
+        let keys: Vec<_> = lib.tracks.iter().map(|tr| tr.best_key()).collect();
         let arts: Vec<_> = lib
             .tracks
             .iter()
@@ -1045,7 +1108,11 @@ impl Workspace {
                         "{} BPM{}  ·  {}",
                         tr.tempo().map(|b| format!("{b:.0}")).unwrap_or_else(|| "—".into()),
                         if tr.tempo_is_detected() { " (detected)" } else { "" },
-                        tr.key.map(|k| k.to_string()).unwrap_or_else(|| "no key".into())
+                        match tr.best_key() {
+                            Some(k) if tr.key_is_detected() => format!("{k} (detected)"),
+                            Some(k) => k.to_string(),
+                            None => "no key".into(),
+                        }
                     ))
                     .into_any_element()];
                 if let Some(a) = graph.artist_of(i) {

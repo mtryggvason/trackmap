@@ -4,6 +4,7 @@ pub mod artwork;
 pub mod cache;
 pub mod changes;
 pub mod key;
+pub mod key_detect;
 pub mod playlists;
 pub mod scan;
 pub mod settings;
@@ -83,12 +84,28 @@ pub struct Track {
     /// Whether audio analysis has run (even if it found nothing).
     #[serde(default)]
     pub analyzed: bool,
+    /// Key found by audio analysis, for tracks without one in their tags.
+    #[serde(default)]
+    pub detected_key: Option<Camelot>,
+    /// Whether key analysis has run (even if it found nothing).
+    #[serde(default)]
+    pub key_analyzed: bool,
 }
 
 impl Track {
     /// The BPM to use: from the tags if present, otherwise the detected one.
     pub fn tempo(&self) -> Option<f32> {
         self.bpm.or(self.detected_bpm)
+    }
+
+    /// The key to use: from the tags if present, otherwise the detected one.
+    pub fn best_key(&self) -> Option<Camelot> {
+        self.key.or(self.detected_key)
+    }
+
+    /// Whether the key came from analysis rather than the file's tags.
+    pub fn key_is_detected(&self) -> bool {
+        self.key.is_none() && self.detected_key.is_some()
     }
 
     /// Whether the tempo came from analysis rather than the file's tags.

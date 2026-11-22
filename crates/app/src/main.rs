@@ -917,8 +917,21 @@ impl Workspace {
             })
             .collect();
         let selected = self.map.selected.as_ref().and_then(|k| graph.find(k));
+        // Tempo bins get finer as you zoom in, so a bin is always about a cover wide on screen.
+        let bin = graph
+            .layout
+            .bin_for(self.map.transform().scale(), (map::cover_size(self.map.zoom) * 1.3).max(14.0));
+        let positions = match &self.map.positions {
+            Some((b, g, p)) if *b == bin && Rc::ptr_eq(g, &graph) => p.clone(),
+            _ => {
+                let p = Rc::new(graph.positions(bin));
+                self.map.positions = Some((bin, graph.clone(), p.clone()));
+                p
+            }
+        };
         let (frame, drawn) = Frame::build(
             &graph,
+            &positions,
             &keys,
             &arts,
             &self.visible,

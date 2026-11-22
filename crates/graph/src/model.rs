@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use std::path::PathBuf;
 
-use trackmap_core::{Playlist, Track};
+use trackmap_core::{Camelot, Playlist, Track};
 
 use crate::{MapLayout, Point};
 
@@ -45,7 +45,10 @@ pub struct Graph {
     label_artists: Vec<Vec<usize>>,
     playlist_songs: Vec<Vec<usize>>,
 
-    song_pos: Vec<Point>,
+    song_tempo: Vec<Option<f32>>,
+    song_key: Vec<Option<Camelot>>,
+    /// Each song's place in (artist, title, path) order, used to order songs within a cell.
+    song_rank: Vec<usize>,
 }
 
 /// Interns strings into indices, keeping first-seen order.
@@ -76,7 +79,15 @@ impl Graph {
             g.song_playlists.push(Vec::new());
         }
 
-        g.song_pos = stack_positions(tracks, layout);
+        g.song_tempo = tracks.iter().map(|t| t.tempo()).collect();
+        g.song_key = tracks.iter().map(|t| t.best_key()).collect();
+        let lower = |s: &Option<String>| s.as_deref().unwrap_or("").to_lowercase();
+        let mut order: Vec<usize> = (0..tracks.len()).collect();
+        order.sort_by_key(|&i| (lower(&tracks[i].artist), lower(&tracks[i].title), tracks[i].path.clone()));
+        g.song_rank = vec![0; tracks.len()];
+        for (rank, i) in order.into_iter().enumerate() {
+            g.song_rank[i] = rank;
+        }
 
         g.artist_songs = vec![Vec::new(); g.artists.len()];
         g.label_songs = vec![Vec::new(); g.labels.len()];
@@ -166,8 +177,30 @@ impl Graph {
         }
     }
 
-    pub fn song_position(&self, song: usize) -> Point {
-        self.song_pos[song]
+    /// Every song's position with tempo grouped into bins of `bin` BPM: x is the bin, y the
+    /// key row, and songs sharing a cell are spread evenly across it (by artist, then title).
+    pub fn positions(&self, bin: f32) -> Vec<Point> {
+        let l = &self.layout;
+        let mut cells: BTreeMap<(i64, usize), Vec<usize>> = BTreeMap::new();
+        for s in 0..self.song_count() {
+            let col = match self.song_tempo[s].filter(|b| b.is_finite() && *b > 0.0) {
+                Some(b) => (b / bin).round() as i64,
+                None => i64::MIN,
+            };
+            cells.entry((col, MapLayout::key_row(self.song_key[s]))).or_default().push(s);
+        }
+        let mut pos = vec![Point { x: 0.0, y: 0.0 }; self.song_count()];
+        for ((_, row), mut members) in cells {
+            members.sort_by_key(|&s| self.song_rank[s]);
+            let n = members.len();
+            let (cx, width) = l.cell_x(self.song_tempo[members[0]], bin);
+            // Use up to 80% of the cell so neighbouring cells stay apart.
+            let gap = if n > 1 { width * 0.8 / (n - 1) as f32 } else { 0.0 };
+            for (i, &s) in members.iter().enumerate() {
+                pos[s] = Point { x: cx + (i as f32 - (n as f32 - 1.0) / 2.0) * gap, y: l.row_y(row) };
+            }
+        }
+        pos
     }
 
     /// What the inspector lists for a selection.
@@ -189,38 +222,6 @@ impl Graph {
         }
     }
 
-}
-
-/// Places songs in BPM columns. Within a column songs are ordered by artist then title, so
-/// an artist's tracks at the same tempo sit together.
-fn stack_positions(tracks: &[Track], layout: &MapLayout) -> Vec<Point> {
-    let mut columns: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
-    for (i, t) in tracks.iter().enumerate() {
-        let col = match t.tempo().filter(|b| b.is_finite() && *b > 0.0) {
-            Some(b) => b.round() as i64,
-            None => i64::MIN,
-        };
-        columns.entry(col).or_default().push(i);
-    }
-    let lower = |s: &Option<String>| s.as_deref().unwrap_or("").to_lowercase();
-    let tallest = columns.values().map(Vec::len).max().unwrap_or(1);
-    let spacing = layout.stack_spacing(tallest);
-
-    let mut pos = vec![Point { x: 0.0, y: 0.0 }; tracks.len()];
-    for members in columns.values_mut() {
-        members.sort_by_key(|&i| {
-            let t = &tracks[i];
-            (lower(&t.artist), lower(&t.title), t.path.clone())
-        });
-        let n = members.len();
-        for (row, &i) in members.iter().enumerate() {
-            pos[i] = Point {
-                x: layout.column_x(tracks[i].tempo()),
-                y: layout.stack_y(row, n, spacing),
-            };
-        }
-    }
-    pos
 }
 
 #[cfg(test)]
@@ -303,29 +304,30 @@ mod tests {
     }
 
     #[test]
-    fn same_bpm_songs_share_a_column_sorted_by_artist() {
+    fn songs_go_by_tempo_bin_and_key_row() {
         let tracks = vec![
-            track("/z", "Zed", "", "1A", 124.0),
-            track("/a", "Ann", "", "9B", 124.2),
-            track("/b", "Bob", "", "", 130.0),
+            track("/z", "Zed", "", "8A", 124.0),
+            track("/a", "Ann", "", "8A", 124.3),
+            track("/b", "Bob", "", "9A", 124.0),
             track("/n", "Nia", "", "", 0.0),
         ];
         let g = Graph::build(&tracks, &[]);
-        let (z, a, b) = (g.song_position(0), g.song_position(1), g.song_position(2));
-        assert_eq!(z.x, a.x, "124 and 124.2 share a column");
-        assert!(a.y < z.y, "Ann above Zed");
-        assert!(b.x > a.x);
-        assert_eq!(b.y, 0.0, "a lone song is centred");
-        assert_eq!(g.song_position(3).x, g.layout.no_bpm_x());
+
+        // Whole-BPM bins: Zed and Ann share the 124/8A cell, side by side, Ann first.
+        let p = g.positions(1.0);
+        assert_eq!(p[0].y, p[1].y);
+        assert!(p[1].x < p[0].x, "Ann before Zed");
+        let centre = g.layout.bpm_x(124.0);
+        assert!(((p[0].x + p[1].x) / 2.0 - centre).abs() < 1e-3, "cell is centred on its BPM");
+        assert!(p[2].y > p[0].y, "9A is below 8A");
+        assert_eq!(p[2].x, centre, "a lone song sits at its cell's centre");
+        assert_eq!(p[3].x, g.layout.no_bpm_x());
+        assert_eq!(p[3].y, g.layout.row_y(crate::KEY_ROWS - 1));
+
+        // Zoomed in to 0.1 BPM bins, 124.0 and 124.3 separate and each sits at its own BPM.
+        let p = g.positions(0.1);
+        assert!((p[0].x - g.layout.bpm_x(124.0)).abs() < 1e-3);
+        assert!((p[1].x - g.layout.bpm_x(124.3)).abs() < 1e-2);
     }
 
-    #[test]
-    fn positions_are_stable_and_tempo_dominates() {
-        let (a, b) = (sample(), sample());
-        let d = |p: Point, q: Point| ((p.x - q.x).powi(2) + (p.y - q.y).powi(2)).sqrt();
-        assert_eq!(a.song_position(0), b.song_position(0));
-        // 8A and 9A are neighbours on the wheel; 2B is across it.
-        let (s0, s1, s2) = (a.song_position(0), a.song_position(1), a.song_position(2));
-        assert!(d(s0, s1) < d(s0, s2));
-    }
 }

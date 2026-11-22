@@ -11,7 +11,7 @@ use gpui::{
     Pixels, Point, RenderImage, SharedString, TextRun, Window,
 };
 use trackmap_core::Camelot;
-use trackmap_graph::{Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint};
+use trackmap_graph::{Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint, KEY_ROWS};
 
 /// Which list the Artists / Labels / Playlists chip has open.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,6 +49,8 @@ pub struct MapState {
     pub bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Songs drawn last frame, in paint order.
     pub drawn: Vec<(usize, WorldPoint)>,
+    /// Song positions for a tempo bin width and graph, reused until either changes.
+    pub positions: Option<(f32, Rc<Graph>, Rc<Vec<WorldPoint>>)>,
 }
 
 impl Default for MapState {
@@ -63,6 +65,7 @@ impl Default for MapState {
             picker: None,
             bounds: Rc::new(Cell::new(Bounds::default())),
             drawn: Vec::new(),
+            positions: None,
         }
     }
 }
@@ -79,6 +82,11 @@ impl Transform {
         let h = f32::from(bounds.size.height);
         let fit = (w / (2.0 * WORLD_HALF_W)).min(h / (2.0 * WORLD_HALF_H)).max(0.0001);
         Self { center: bounds.center() + pan, scale: fit * zoom }
+    }
+
+    /// Screen pixels per world unit.
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 
     pub fn to_screen(&self, p: WorldPoint) -> Point<Pixels> {
@@ -139,6 +147,8 @@ pub fn key_color(k: Camelot) -> Hsla {
 
 struct DrawSong {
     pos: WorldPoint,
+    /// Lower is more important when titles compete for space.
+    label_priority: u8,
     art: Option<Arc<RenderImage>>,
     dimmed: bool,
     fill: Hsla,
@@ -165,6 +175,7 @@ impl Frame {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         graph: &Graph,
+        positions: &[WorldPoint],
         keys: &[Option<Camelot>],
         arts: &[Option<Arc<RenderImage>>],
         shown: &[usize],
@@ -185,15 +196,15 @@ impl Frame {
         let mut order: Vec<usize> = shown.iter().copied().filter(|s| !focus.contains(s)).collect();
         order.extend(focus_list.iter().copied());
 
-        let crowded = shown.len() > 40;
-        let song_labels_zoomed = state.zoom >= 3.0 && shown.len() <= 600;
-        let label_focus = focus.len() <= 60;
+        // Titles are only drawn where they fit (see paint), so every song can ask for one;
+        // very large views skip them to keep painting fast.
+        let label_all = order.len() <= 1500;
 
         let mut drawn = Vec::with_capacity(order.len());
         let songs = order
             .iter()
             .map(|&s| {
-                let pos = graph.song_position(s);
+                let pos = positions[s];
                 drawn.push((s, pos));
                 let in_focus = focus.contains(&s);
                 let is_hover = hovered == Some(s);
@@ -203,10 +214,18 @@ impl Frame {
                     (true, false) => (hsla(0., 0., 0.55, 0.2), ring.opacity(0.2)),
                     _ => (hsla(0., 0., 0.55, 1.), ring),
                 };
-                let labelled =
-                    is_hover || (in_focus && label_focus) || !crowded || song_labels_zoomed;
+                let labelled = is_hover || in_focus || label_all;
                 DrawSong {
                     pos,
+                    label_priority: if is_hover {
+                        0
+                    } else if in_focus {
+                        1
+                    } else if has_focus {
+                        3
+                    } else {
+                        2
+                    },
                     art: arts.get(s).cloned().flatten(),
                     dimmed: has_focus && !in_focus,
                     fill,
@@ -225,7 +244,7 @@ impl Frame {
             .collect();
 
         let route = match selected {
-            Some(NodeId::Playlist(_)) => focus_list.iter().map(|&s| graph.song_position(s)).collect(),
+            Some(NodeId::Playlist(_)) => focus_list.iter().map(|&s| positions[s]).collect(),
             _ => Vec::new(),
         };
 
@@ -238,17 +257,8 @@ impl Frame {
         let t = &self.theme;
         let font = window.text_style().font();
 
-        // BPM axis along the bottom.
         let l = &self.layout;
         let muted: Hsla = t.text_muted.into();
-        let axis_y = l.half_height + 36.;
-        for bpm in l.bpm_ticks() {
-            let s = tf.to_screen(WorldPoint { x: l.bpm_x(bpm), y: axis_y });
-            paint_text(window, cx, &font, &format!("{bpm:.0}"), 11., muted, s, true);
-        }
-        let s = tf.to_screen(WorldPoint { x: l.no_bpm_x(), y: axis_y });
-        paint_text(window, cx, &font, "no BPM", 11., muted.opacity(0.6), s, true);
-
 
         // A selected playlist's route, in play order.
         if self.route.len() > 1 {
@@ -264,6 +274,7 @@ impl Frame {
 
         let cover = cover_size(self.zoom);
         let bg: Hsla = t.bg_app.into();
+        let mut node_boxes = Vec::with_capacity(self.songs.len());
         for s in &self.songs {
             let c = tf.to_screen(s.pos);
             let d = if let Some(img) = &s.art {
@@ -289,10 +300,82 @@ impl Frame {
                 ));
                 d
             };
-            if let Some(label) = &s.label {
-                let at = point(c.x + d / 2. + px(5.), c.y);
-                paint_text(window, cx, &font, label, 12., s.label_color, at, false);
+            let (cx_, cy_, half) = (f32::from(c.x), f32::from(c.y), f32::from(d) / 2.0);
+            node_boxes.push(Rect { x0: cx_ - half, y0: cy_ - half, x1: cx_ + half, y1: cy_ + half });
+        }
+
+        // Titles centred under their covers; where two would collide (or a title would cover
+        // another song), only the more important one is drawn. Zooming in spreads songs out,
+        // so more titles fit.
+        const LABEL_SIZE: f32 = 11.0;
+        const LABEL_MAX_W: f32 = 140.0;
+        let view = Rect {
+            x0: f32::from(bounds.origin.x),
+            y0: f32::from(bounds.origin.y),
+            x1: f32::from(bounds.origin.x + bounds.size.width),
+            y1: f32::from(bounds.origin.y + bounds.size.height),
+        };
+        let mut candidates = Vec::new();
+        for (i, s) in self.songs.iter().enumerate() {
+            let Some(label) = &s.label else { continue };
+            let nb = node_boxes[i];
+            if !nb.overlaps(&view) {
+                continue;
             }
+            let line = shape_fitted(window, &font, label, LABEL_SIZE, s.label_color, LABEL_MAX_W);
+            let w = f32::from(line.width);
+            let cx_ = (nb.x0 + nb.x1) / 2.0;
+            let rect = Rect { x0: cx_ - w / 2.0, y0: nb.y1 + 2.0, x1: cx_ + w / 2.0, y1: nb.y1 + 2.0 + LABEL_SIZE * 1.3 };
+            candidates.push(LabelCandidate { owner: i, rect, priority: s.label_priority, line });
+        }
+        let keep = place_labels(
+            &candidates.iter().map(|c| (c.owner, c.rect, c.priority)).collect::<Vec<_>>(),
+            &node_boxes,
+        );
+        for (c, keep) in candidates.into_iter().zip(keep) {
+            if keep {
+                let origin = point(px(c.rect.x0), px(c.rect.y0));
+                let _ = c.line.paint(origin, px(LABEL_SIZE * 1.3), gpui::TextAlign::Left, None, window, cx);
+            }
+        }
+
+        // Axes, pinned to the canvas edges so they stay visible while zooming and panning:
+        // BPM along the bottom (finer steps as you zoom in), keys down the left.
+        let left = tf.to_world(bounds.origin).x;
+        let right = tf.to_world(point(bounds.origin.x + bounds.size.width, bounds.origin.y)).x;
+        let (step, ticks) = l.bpm_ticks(l.x_bpm(left), l.x_bpm(right), tf.scale(), 56.0);
+        let axis_y = bounds.origin.y + bounds.size.height - px(28.);
+        let strip = Bounds::new(point(bounds.origin.x, axis_y - px(10.)), size(bounds.size.width, px(20.)));
+        window.paint_quad(quad(strip, px(0.), bg.opacity(0.85), px(0.), bg, BorderStyle::Solid));
+        for bpm in ticks {
+            let x = tf.to_screen(WorldPoint { x: l.bpm_x(bpm), y: 0. }).x;
+            let text = if step < 1.0 { format!("{bpm:.1}") } else { format!("{bpm:.0}") };
+            paint_text(window, cx, &font, &text, 11., muted, point(x, axis_y), true);
+        }
+        let no_bpm = tf.to_screen(WorldPoint { x: l.no_bpm_x(), y: 0. }).x;
+        if no_bpm > bounds.origin.x {
+            paint_text(window, cx, &font, "no BPM", 11., muted.opacity(0.6), point(no_bpm, axis_y), true);
+        }
+        let key_x = bounds.origin.x + px(22.);
+        let gutter = Bounds::new(bounds.origin, size(px(44.), bounds.size.height));
+        window.paint_quad(quad(gutter, px(0.), bg.opacity(0.85), px(0.), bg, BorderStyle::Solid));
+        let row_px = l.row_height() * tf.scale();
+        for row in 0..KEY_ROWS {
+            // When rows are tight, label only the minor keys (1A, 2A, …) and the "?" row.
+            if row_px < 14.0 && row % 2 == 1 && row != KEY_ROWS - 1 {
+                continue;
+            }
+            let y = tf.to_screen(WorldPoint { x: 0., y: l.row_y(row) }).y;
+            if y < bounds.origin.y || y > axis_y - px(12.) {
+                continue;
+            }
+            let (text, color) = if row == KEY_ROWS - 1 {
+                ("?".to_string(), muted.opacity(0.6))
+            } else {
+                let k = Camelot::new((row / 2) as u8 + 1, row % 2 == 0).unwrap();
+                (k.to_string(), key_color(k).opacity(0.8))
+            };
+            paint_text(window, cx, &font, &text, 10., color, point(key_x, y), true);
         }
 
         // Play-order numbers on top of the route.
@@ -301,6 +384,77 @@ impl Frame {
             paint_text(window, cx, &font, &(i + 1).to_string(), 10., t.bg_app.into(), c, true);
         }
     }
+}
+
+/// Screen-space rectangle for label placement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rect {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl Rect {
+    fn overlaps(&self, o: &Rect) -> bool {
+        self.x0 < o.x1 && o.x0 < self.x1 && self.y0 < o.y1 && o.y0 < self.y1
+    }
+}
+
+struct LabelCandidate {
+    owner: usize,
+    rect: Rect,
+    priority: u8,
+    line: gpui::ShapedLine,
+}
+
+/// Greedy label placement: in priority order (then paint order), keep a label if it overlaps
+/// neither an already kept label nor any song other than its own.
+fn place_labels(labels: &[(usize, Rect, u8)], nodes: &[Rect]) -> Vec<bool> {
+    let mut order: Vec<usize> = (0..labels.len()).collect();
+    order.sort_by_key(|&i| labels[i].2);
+    let mut kept: Vec<Rect> = Vec::new();
+    let mut keep = vec![false; labels.len()];
+    for i in order {
+        let (owner, rect, _) = labels[i];
+        let hits_node = nodes.iter().enumerate().any(|(n, b)| n != owner && rect.overlaps(b));
+        if !hits_node && !kept.iter().any(|k| rect.overlaps(k)) {
+            kept.push(rect);
+            keep[i] = true;
+        }
+    }
+    keep
+}
+
+/// Shapes `text`, shortening it with "…" to fit `max_w` pixels.
+fn shape_fitted(
+    window: &mut Window,
+    font: &gpui::Font,
+    text: &str,
+    size_px: f32,
+    color: Hsla,
+    max_w: f32,
+) -> gpui::ShapedLine {
+    let shape = |window: &mut Window, s: String| {
+        let run = TextRun {
+            len: s.len(),
+            font: font.clone(),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window.text_system().shape_line(SharedString::from(s), px(size_px), &[run], None)
+    };
+    let line = shape(window, text.to_string());
+    let w = f32::from(line.width);
+    if w <= max_w {
+        return line;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let keep = ((chars.len() as f32 * max_w / w) as usize).saturating_sub(1).max(1);
+    let short: String = chars[..keep.min(chars.len())].iter().collect::<String>().trim_end().to_string() + "…";
+    shape(window, short)
 }
 
 /// Paints one line of text vertically centred on `at` (and horizontally too if `centered`).
@@ -351,6 +505,19 @@ mod tests {
         assert!((world_before.x - world_after.x).abs() < 0.01);
         assert!((world_before.y - world_after.y).abs() < 0.01);
         assert_eq!(s.zoom, 2.5);
+    }
+
+    #[test]
+    fn labels_never_overlap_and_priority_wins() {
+        let r = |x0: f32, y0: f32, x1: f32, y1: f32| Rect { x0, y0, x1, y1 };
+        let nodes = [r(0., 0., 10., 10.), r(30., 0., 40., 10.), r(0., 30., 10., 40.)];
+        let labels = [
+            (0, r(-20., 12., 30., 26.), 2), // under song 0
+            (1, r(10., 12., 60., 26.), 0),  // under song 1, overlaps song 0's title, hovered
+            (2, r(-20., 42., 30., 56.), 2), // under song 2, free
+            (0, r(-5., 25., 15., 35.), 1),  // would cover song 2
+        ];
+        assert_eq!(place_labels(&labels, &nodes), [false, true, true, false]);
     }
 
     #[test]

@@ -1,7 +1,14 @@
 # TrackMap
 
-Organise a music folder for the nap.works Devious Pocket: a map of your tracks by tempo and key,
-playlists as folders, and (soon) sync to a Rekordbox-style USB. See `PLAN.md`.
+A fast, lightweight alternative to Rekordbox for preparing music for the
+[nap.works](https://nap.works/) Devious Pocket.
+
+Open a music folder and TrackMap lays your tracks out on a map: tempo from left to right, key
+(Camelot) from top to bottom, with cover art. It detects BPM and key, plays tracks with a
+waveform, keeps playlists as plain folders, and syncs everything to a Rekordbox-style USB drive
+without touching what's already on it. The folder is watched, so new files show up on their own.
+
+See `PLAN.md` for the design and what's next.
 
 ## Build
 
@@ -16,26 +23,10 @@ Try it without your own music:
     cargo run -p trackmap-core --example demo_library -- /tmp/trackmap-demo
     cargo run -p trackmap -- /tmp/trackmap-demo
 
+Build `TrackMap.app` (zipped into `dist/`):
+
+    scripts/bundle-macos.sh
+
 ## Test
 
     cargo test --workspace
-
-## Share it
-
-GitHub builds the app for you (`.github/workflows/build.yml`):
-
-- Every push to `main` builds a universal (Apple Silicon + Intel) `TrackMap.app`, downloadable
-  from that run's artifacts on the Actions tab.
-- Pushing a version tag publishes a GitHub Release with the zipped app attached:
-
-      git tag v0.1.0 && git push origin v0.1.0
-
-To build it locally instead (needs several GB of free disk):
-
-    scripts/fetch-gpui.sh
-    scripts/bundle-macos.sh            # this Mac's architecture
-    scripts/bundle-macos.sh --universal   # needs: rustup target add x86_64-apple-darwin aarch64-apple-darwin
-
-The app is ad-hoc signed but not notarized (that needs a paid Apple Developer account), so the
-first time it's opened: **right-click TrackMap → Open → Open**, or System Settings → Privacy &
-Security → **Open Anyway**.

@@ -721,7 +721,7 @@ impl Frame {
         for s in &self.songs {
             let c = tf.to_screen(s.pos);
             // Hovered and selected covers grow smoothly (see MapState::step_grow).
-            let d = px((cover * (1.0 + 0.3 * ease(s.grow))).min(MAX_COVER * 1.15));
+            let d = px((cover * (1.0 + 0.15 * ease(s.grow))).min(MAX_COVER * 1.15));
             let b = Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d));
             let radius = px(3.);
             match &s.art {

@@ -17,6 +17,11 @@ gpui = { path = "vendor/zed/crates/gpui" }
 # runtime_shaders: compile Metal shaders at startup so a full Xcode install is not required.
 gpui_platform = { path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "runtime_shaders"] }
 
+# Shared builds: smaller, faster binaries.
+[profile.release]
+lto = "thin"
+strip = true
+
 # Keep target/ small: full debug info only for our own crates, none for dependencies.
 [profile.dev]
 debug = "line-tables-only"

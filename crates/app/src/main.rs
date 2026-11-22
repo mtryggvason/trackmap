@@ -1599,6 +1599,11 @@ impl Workspace {
                         }
                         // Empty space: drop the song selection but stay in the group.
                         _ if this.map.picker.is_some() => this.map.picker = None,
+                        // Double-click empty space: zoom in there (shift: out).
+                        _ if e.click_count >= 2 => {
+                            let factor = if e.modifiers.shift { 0.5 } else { 2.0 };
+                            this.map.zoom_towards(e.position, factor);
+                        }
                         _ => {
                             if this.map.selected != this.map.scope {
                                 this.map.back();

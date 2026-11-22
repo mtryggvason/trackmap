@@ -38,6 +38,8 @@ struct ViewMotion {
     start: Instant,
     from: (Point<Pixels>, f32),
     to: (Point<Pixels>, f32),
+    /// Keep this world point under this screen position throughout (zooming towards a spot).
+    anchor: Option<(WorldPoint, Point<Pixels>)>,
 }
 
 /// Zoom limits. Pinching past them meets resistance and springs back on release.
@@ -289,7 +291,22 @@ impl MapState {
 
     /// Eases the camera to a new pan/zoom instead of jumping there.
     fn move_view_to(&mut self, pan: Point<Pixels>, zoom: f32) {
-        self.view_motion = Some(ViewMotion { start: Instant::now(), from: (self.pan, self.zoom), to: (pan, zoom) });
+        self.view_motion =
+            Some(ViewMotion { start: Instant::now(), from: (self.pan, self.zoom), to: (pan, zoom), anchor: None });
+    }
+
+    /// Smoothly zooms by `factor` towards `anchor`, keeping the point under it in place
+    /// (double-click to zoom in, shift-double-click to zoom out).
+    pub fn zoom_towards(&mut self, anchor: Point<Pixels>, factor: f32) {
+        let world = self.transform().to_world(anchor);
+        let zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.glide = None;
+        self.view_motion = Some(ViewMotion {
+            start: Instant::now(),
+            from: (self.pan, self.zoom),
+            to: (self.pan, zoom),
+            anchor: Some((world, anchor)),
+        });
     }
 
     /// Stops any camera transition (the user is steering).
@@ -304,9 +321,15 @@ impl MapState {
         let e = ease(t);
         let (fp, fz) = m.from;
         let (tp, tz) = m.to;
+        let anchor = m.anchor;
         self.pan = point(fp.x + (tp.x - fp.x) * e, fp.y + (tp.y - fp.y) * e);
         // Interpolate zoom geometrically so it feels even in and out.
         self.zoom = fz * (tz / fz).powf(e);
+        if let Some((world, screen)) = anchor {
+            // Re-pan so the anchored world point stays under the cursor at this zoom.
+            let moved = self.transform().to_screen(world);
+            self.pan = self.pan + (screen - moved);
+        }
         if t >= 1.0 {
             self.view_motion = None;
             return false;
@@ -1114,6 +1137,27 @@ mod tests {
         assert!(s.zoom < MAX_ZOOM * 1.2_f32.powi(10), "with resistance");
         run_glide(&mut s, t);
         assert!((s.zoom - MAX_ZOOM).abs() < 1e-3, "springs back to the limit: {}", s.zoom);
+    }
+
+    #[test]
+    fn double_click_zoom_keeps_the_spot_under_the_cursor() {
+        let mut s = MapState::default();
+        s.bounds.set(Bounds::new(point(px(0.), px(0.)), size(px(1000.), px(700.))));
+        let spot = point(px(700.), px(200.));
+        let world = s.transform().to_world(spot);
+        s.zoom_towards(spot, 2.0);
+        let start = s.view_motion.as_ref().unwrap().start;
+        for ms in [80u64, 160, 240, 1000] {
+            s.step_view(start + Duration::from_millis(ms));
+            let back = s.transform().to_world(spot);
+            assert!((back.x - world.x).abs() < 0.5 && (back.y - world.y).abs() < 0.5, "drifted at {ms} ms");
+        }
+        assert!((s.zoom - 2.0).abs() < 1e-3);
+        // Zooming out stops at the limit.
+        s.zoom = MIN_ZOOM;
+        s.zoom_towards(spot, 0.5);
+        s.step_view(Instant::now() + TRANSITION * 2);
+        assert_eq!(s.zoom, MIN_ZOOM);
     }
 
     #[test]

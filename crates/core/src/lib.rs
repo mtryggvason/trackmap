@@ -9,6 +9,7 @@ pub mod key_detect;
 pub mod playlists;
 pub mod scan;
 pub mod settings;
+pub mod sync;
 pub mod tags;
 pub mod tempo;
 pub mod watch;

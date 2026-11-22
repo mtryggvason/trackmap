@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 image = { version = "0.25.1", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2.191"
 lofty = "0.25.5"
 notify = "9.0.0"
 notify-debouncer-full = "0.8.0"

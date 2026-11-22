@@ -18,7 +18,7 @@ use map::{Frame, MapState, Picker};
 use theme::Theme;
 use trackmap_core::settings::Settings;
 use trackmap_core::{playlists, Library, Playlist, Watcher, PLAYLISTS_DIR};
-use trackmap_graph::{Graph, HarmonicLayout, NodeId};
+use trackmap_graph::{Graph, NodeId};
 
 actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
 
@@ -84,11 +84,7 @@ impl Workspace {
     /// Rebuilds the graph after the library or playlists change.
     fn rebuild_graph(&mut self) {
         self.graph = match &self.library {
-            LibraryState::Loaded(lib) => Some(Rc::new(Graph::build(
-                &lib.tracks,
-                &self.playlists,
-                &HarmonicLayout::default(),
-            ))),
+            LibraryState::Loaded(lib) => Some(Rc::new(Graph::build(&lib.tracks, &self.playlists))),
             _ => None,
         };
     }

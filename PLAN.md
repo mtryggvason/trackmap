@@ -62,11 +62,12 @@ crates/
 **Only songs are drawn.** Artists, labels and playlists are groups of songs. Selecting one
 highlights its songs and dims the rest; they never appear as nodes.
 
-**Layout ("harmonic map")**
-- Angle = Camelot number (1–12). Minor keys (A) sit on the inner ring, major keys (B) on the
-  outer ring, so compatible keys (±1, relative major/minor) are neighbours.
-- Radius within the ring = BPM (log scale), plus a small stable jitter. Songs without a key sit
-  in the middle.
+**Layout (tempo first)**
+- x = BPM, slow left to fast right. The axis is fitted to the library's tempo range (rounded to
+  5 BPM) and labelled along the bottom. Songs without a BPM get a column on the far left.
+- y = key, secondary: Camelot rows with A/B pairs adjacent (1A, 1B, 2A, …), so relative
+  major/minor and neighbouring keys stay close. Songs without a key get a row at the bottom.
+- A small stable jitter keeps songs with the same key and BPM from stacking.
 - Songs are *not* grouped by artist/label/playlist in space; position is purely musical.
 
 **Selecting**

@@ -10,7 +10,7 @@ use gpui::{
     Pixels, Point, SharedString, TextRun, Window,
 };
 use trackmap_core::Camelot;
-use trackmap_graph::{Graph, HarmonicLayout, NodeId, NodeKey, Point as WorldPoint};
+use trackmap_graph::{Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint};
 
 /// Which list the Artists / Labels / Playlists chip has open.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22,8 +22,10 @@ pub enum Picker {
 
 use crate::theme::Theme;
 
-/// World radius that fits the screen at zoom 1 (outer edge of the major-key ring plus margin).
-const WORLD_RADIUS: f32 = 920.0;
+/// World extent that fits the screen at zoom 1: the layout plus room for the key labels on
+/// the left, the no-BPM column, and the BPM axis below.
+const WORLD_HALF_W: f32 = 1060.0;
+const WORLD_HALF_H: f32 = 580.0;
 const HIT_RADIUS: f32 = 10.0;
 
 pub struct MapState {
@@ -69,7 +71,8 @@ impl Transform {
     pub fn new(bounds: Bounds<Pixels>, pan: Point<Pixels>, zoom: f32) -> Self {
         let w = f32::from(bounds.size.width);
         let h = f32::from(bounds.size.height);
-        Self { center: bounds.center() + pan, scale: w.min(h).max(1.0) / 2.0 / WORLD_RADIUS * zoom }
+        let fit = (w / (2.0 * WORLD_HALF_W)).min(h / (2.0 * WORLD_HALF_H)).max(0.0001);
+        Self { center: bounds.center() + pan, scale: fit * zoom }
     }
 
     pub fn to_screen(&self, p: WorldPoint) -> Point<Pixels> {
@@ -139,6 +142,7 @@ pub struct Frame {
     songs: Vec<DrawSong>,
     /// A selected playlist's songs in play order.
     route: Vec<WorldPoint>,
+    layout: MapLayout,
     pan: Point<Pixels>,
     zoom: f32,
     theme: Theme,
@@ -211,7 +215,8 @@ impl Frame {
             _ => Vec::new(),
         };
 
-        (Self { songs, route, pan: state.pan, zoom: state.zoom, theme: *theme }, drawn)
+        let layout = graph.layout;
+        (Self { songs, route, layout, pan: state.pan, zoom: state.zoom, theme: *theme }, drawn)
     }
 
     pub fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
@@ -219,17 +224,26 @@ impl Frame {
         let t = &self.theme;
         let font = window.text_style().font();
 
-        // Key names around the wheel: minor keys inside, major keys outside.
-        let layout = HarmonicLayout::default();
-        let major_out = layout.inner + 2. * layout.ring_width + layout.gap;
+        // BPM axis along the bottom, key rows down the left.
+        let l = &self.layout;
+        let muted: Hsla = t.text_muted.into();
+        let axis_y = l.half_height + 36.;
+        for bpm in l.bpm_ticks() {
+            let s = tf.to_screen(WorldPoint { x: l.bpm_x(bpm), y: axis_y });
+            paint_text(window, cx, &font, &format!("{bpm:.0}"), 11., muted, s, true);
+        }
+        let s = tf.to_screen(WorldPoint { x: l.no_bpm_x(), y: axis_y });
+        paint_text(window, cx, &font, "no BPM", 11., muted.opacity(0.6), s, true);
+        let label_x = l.no_bpm_x() - 70.;
         for n in 1..=12u8 {
-            for (minor, r) in [(true, layout.inner - 28.), (false, major_out + 28.)] {
+            for minor in [true, false] {
                 let k = Camelot::new(n, minor).unwrap();
-                let a = k.angle();
-                let s = tf.to_screen(WorldPoint { x: r * a.cos(), y: r * a.sin() });
-                paint_text(window, cx, &font, &k.to_string(), 11., key_color(k).opacity(0.7), s, true);
+                let s = tf.to_screen(WorldPoint { x: label_x, y: l.key_y(Some(k)) });
+                paint_text(window, cx, &font, &k.to_string(), 10., key_color(k).opacity(0.6), s, true);
             }
         }
+        let s = tf.to_screen(WorldPoint { x: label_x, y: l.key_y(None) });
+        paint_text(window, cx, &font, "?", 10., muted.opacity(0.6), s, true);
 
         // A selected playlist's route, in play order.
         if self.route.len() > 1 {
@@ -320,11 +334,11 @@ mod tests {
     #[test]
     fn hit_finds_nearest_node() {
         let mut s = MapState::default();
-        s.bounds.set(Bounds::new(point(px(0.), px(0.)), size(px(920.), px(920.))));
-        // scale = 460 / 920 = 0.5, centre = (460, 460)
+        s.bounds.set(Bounds::new(point(px(0.), px(0.)), size(px(1060.), px(580.))));
+        // scale = 0.5 on both axes, centre = (530, 290)
         s.drawn = vec![(0, WorldPoint { x: 0., y: 0. }), (1, WorldPoint { x: 30., y: 0. })];
-        assert_eq!(s.hit(point(px(462.), px(460.))), Some(0));
-        assert_eq!(s.hit(point(px(474.), px(460.))), Some(1));
-        assert_eq!(s.hit(point(px(600.), px(600.))), None);
+        assert_eq!(s.hit(point(px(532.), px(290.))), Some(0));
+        assert_eq!(s.hit(point(px(544.), px(290.))), Some(1));
+        assert_eq!(s.hit(point(px(700.), px(400.))), None);
     }
 }

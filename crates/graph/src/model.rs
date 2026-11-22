@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use trackmap_core::{Playlist, Track};
 
-use crate::{HarmonicLayout, Point};
+use crate::{MapLayout, Point};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
@@ -30,6 +30,8 @@ pub enum NodeKey {
 
 #[derive(Debug, Default)]
 pub struct Graph {
+    /// The layout songs were placed with (BPM axis fitted to the library).
+    pub layout: MapLayout,
     pub song_titles: Vec<String>,
     pub song_paths: Vec<PathBuf>,
     pub artists: Vec<String>,
@@ -60,8 +62,9 @@ fn tag(s: &Option<String>) -> Option<&str> {
 }
 
 impl Graph {
-    pub fn build(tracks: &[Track], playlists: &[Playlist], layout: &HarmonicLayout) -> Self {
-        let mut g = Graph::default();
+    pub fn build(tracks: &[Track], playlists: &[Playlist]) -> Self {
+        let layout = &MapLayout::fit(tracks.iter().filter_map(|t| t.bpm));
+        let mut g = Graph { layout: *layout, ..Graph::default() };
         let (mut artist_ix, mut label_ix) = (HashMap::new(), HashMap::new());
 
         for t in tracks {
@@ -188,9 +191,9 @@ impl Graph {
 
 }
 
-/// Harmonic position plus a small stable jitter, so songs with the same key and BPM don't
+/// Layout position plus a small stable jitter, so songs with the same key and BPM don't
 /// sit exactly on top of each other.
-fn song_position(t: &Track, layout: &HarmonicLayout) -> Point {
+fn song_position(t: &Track, layout: &MapLayout) -> Point {
     let mut h = DefaultHasher::new();
     t.path.hash(&mut h);
     let bits = h.finish();
@@ -198,13 +201,8 @@ fn song_position(t: &Track, layout: &HarmonicLayout) -> Point {
     let j2 = ((bits >> 16) & 0xFFFF) as f32 / 65535.0 * 2.0 - 1.0;
 
     let p = layout.position(t.key, t.bpm);
-    if t.key.is_none() {
-        // Unknown key: a disc in the middle.
-        return Point { x: j1 * layout.inner * 0.6, y: p.y + j2 * 20.0 };
-    }
-    // Rotate up to ±0.2 rad (the key wedge is ±0.26) and nudge the radius a little.
-    let (r, a) = ((p.x * p.x + p.y * p.y).sqrt() + j2 * 12.0, p.y.atan2(p.x) + j1 * 0.2);
-    Point { x: r * a.cos(), y: r * a.sin() }
+    // Stay well inside the key row; a few world units sideways is a fraction of a BPM.
+    Point { x: p.x + j1 * 6.0, y: p.y + j2 * layout.row_height() * 0.35 }
 }
 
 #[cfg(test)]
@@ -238,7 +236,7 @@ mod tests {
                 .map(|p| Entry { link: p.into(), target: p.into(), missing: false })
                 .collect(),
         }];
-        Graph::build(&tracks, &playlists, &HarmonicLayout::default())
+        Graph::build(&tracks, &playlists)
     }
 
     #[test]
@@ -250,7 +248,7 @@ mod tests {
         // A rebuild with an extra track first shifts song indices, but keys still resolve.
         let mut tracks = vec![track("/0", "Zed", "", "1A", 120.0)];
         tracks.extend(["/a", "/b", "/c"].map(|p| track(p, "Ann", "Lab1", "8A", 124.0)));
-        let g2 = Graph::build(&tracks, &[], &HarmonicLayout::default());
+        let g2 = Graph::build(&tracks, &[]);
         assert_eq!(g2.find(&g.key(NodeId::Song(0))), Some(NodeId::Song(1)));
         assert_eq!(g2.find(&NodeKey::Playlist("Warmup".into())), None);
         assert_eq!(g2.songs_of(NodeId::Artist(1)), [1, 2, 3]);
@@ -287,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn positions_are_stable_and_compatible_keys_cluster() {
+    fn positions_are_stable_and_tempo_dominates() {
         let (a, b) = (sample(), sample());
         let d = |p: Point, q: Point| ((p.x - q.x).powi(2) + (p.y - q.y).powi(2)).sqrt();
         assert_eq!(a.song_position(0), b.song_position(0));

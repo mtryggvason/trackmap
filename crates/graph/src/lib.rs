@@ -22,7 +22,24 @@ pub struct MapLayout {
     /// World x spans [-half_width, half_width], y spans [-half_height, half_height].
     pub half_width: f32,
     pub half_height: f32,
+    /// Key rows shown, top to bottom (indices from [`MapLayout::key_row`]); the first
+    /// `row_count` entries are used. A subset view only shows the keys it contains.
+    rows: [u8; KEY_ROWS],
+    row_count: u8,
 }
+
+/// Rows never get taller than this, so a view with two keys doesn't stretch absurdly.
+const MAX_ROW_HEIGHT: f32 = 90.0;
+
+const ALL_ROWS: [u8; KEY_ROWS] = {
+    let mut r = [0u8; KEY_ROWS];
+    let mut i = 0;
+    while i < KEY_ROWS {
+        r[i] = i as u8;
+        i += 1;
+    }
+    r
+};
 
 /// 24 key rows plus one for unknown keys.
 pub const KEY_ROWS: usize = 25;
@@ -35,7 +52,14 @@ const NO_BPM_WIDTH: f32 = 60.0;
 
 impl Default for MapLayout {
     fn default() -> Self {
-        Self { bpm_min: 70.0, bpm_max: 180.0, half_width: 900.0, half_height: 500.0 }
+        Self {
+            bpm_min: 70.0,
+            bpm_max: 180.0,
+            half_width: 900.0,
+            half_height: 500.0,
+            rows: ALL_ROWS,
+            row_count: KEY_ROWS as u8,
+        }
     }
 }
 
@@ -51,10 +75,11 @@ impl MapLayout {
         v.sort_by(f32::total_cmp);
         let trim = if v.len() >= 20 { v.len() / 50 } else { 0 };
         let (lo, hi) = (v[trim], v[v.len() - 1 - trim]);
-        let lo = (lo / 5.0).floor() * 5.0;
-        let mut hi = (hi / 5.0).ceil() * 5.0;
+        let (mut lo, mut hi) = ((lo / 5.0).floor() * 5.0, (hi / 5.0).ceil() * 5.0);
         if hi - lo < 20.0 {
-            hi = lo + 20.0; // keep a sensible spread for tiny or uniform libraries
+            // Keep a sensible spread for small or uniform sets, centred on their tempos.
+            let mid = ((lo + hi) / 2.0 / 5.0).round() * 5.0;
+            (lo, hi) = (mid - 10.0, mid + 10.0);
         }
         Self { bpm_min: lo, bpm_max: hi, ..Self::default() }
     }
@@ -95,14 +120,43 @@ impl MapLayout {
         }
     }
 
-    /// Height of one key row.
-    pub fn row_height(&self) -> f32 {
-        2.0 * self.half_height / KEY_ROWS as f32
+    /// Shows only these key rows (in Camelot order), e.g. the keys present in a selection.
+    pub fn with_rows(mut self, used: impl IntoIterator<Item = usize>) -> Self {
+        let mut present = [false; KEY_ROWS];
+        for r in used {
+            present[r.min(KEY_ROWS - 1)] = true;
+        }
+        let mut n = 0;
+        for (r, p) in present.iter().enumerate() {
+            if *p {
+                self.rows[n] = r as u8;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Self { rows: ALL_ROWS, row_count: KEY_ROWS as u8, ..self };
+        }
+        self.row_count = n as u8;
+        self
     }
 
-    /// y of a key row's centre.
+    /// Key rows shown, top to bottom.
+    pub fn rows(&self) -> &[u8] {
+        &self.rows[..self.row_count as usize]
+    }
+
+    /// Height of one key row.
+    pub fn row_height(&self) -> f32 {
+        (2.0 * self.half_height / self.row_count as f32).min(MAX_ROW_HEIGHT)
+    }
+
+    /// y of a key row's centre. Rows are centred vertically; rows not shown go far below.
     pub fn row_y(&self, row: usize) -> f32 {
-        -self.half_height + (row as f32 + 0.5) * self.row_height()
+        let Some(slot) = self.rows().iter().position(|r| *r as usize == row) else {
+            return self.half_height * 4.0;
+        };
+        let total = self.row_height() * self.row_count as f32;
+        -total / 2.0 + (slot as f32 + 0.5) * self.row_height()
     }
 
     /// Cell for a song: (centre x, available width) of its tempo bin.
@@ -164,6 +218,14 @@ mod tests {
         let l = MapLayout::default();
         assert!(l.row_y(0) < l.row_y(1));
         assert!((l.row_y(KEY_ROWS - 1) + l.row_height() / 2.0 - l.half_height).abs() < 1e-3);
+
+        // A view with only two keys shows two rows, centred, capped in height.
+        let sub = l.with_rows([14, 3]);
+        assert_eq!(sub.rows(), [3, 14]);
+        assert_eq!(sub.row_height(), MAX_ROW_HEIGHT);
+        assert!((sub.row_y(3) + sub.row_y(14)).abs() < 1e-3);
+        assert!(sub.row_y(5) > sub.half_height, "hidden rows are off the map");
+        assert_eq!(l.with_rows([]).rows().len(), KEY_ROWS);
     }
 
     #[test]
@@ -181,8 +243,11 @@ mod tests {
 
     #[test]
     fn fit_uses_the_library_range() {
-        let l = MapLayout::fit([122.0, 126.5, 131.0]);
+        let l = MapLayout::fit([122.0, 126.5, 138.0]);
         assert_eq!((l.bpm_min, l.bpm_max), (120.0, 140.0));
+        // A narrow set is centred, not pushed to one edge.
+        let narrow = MapLayout::fit([124.0, 124.0, 126.0]);
+        assert_eq!((narrow.bpm_min, narrow.bpm_max), (115.0, 135.0));
         assert_eq!(l.bpm_x(120.0), -l.half_width);
         assert_eq!(l.bpm_x(140.0), l.half_width);
         assert_eq!(l.bpm_x(200.0), l.half_width, "clamped");
@@ -196,7 +261,7 @@ mod tests {
         let mut many = vec![124.0; 99];
         many.push(70.0);
         let l = MapLayout::fit(many);
-        assert_eq!((l.bpm_min, l.bpm_max), (120.0, 140.0));
+        assert_eq!((l.bpm_min, l.bpm_max), (115.0, 135.0));
     }
 
 }

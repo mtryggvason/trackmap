@@ -664,10 +664,10 @@ impl Workspace {
                     }),
                 )
             }))
-            .when(self.map.selected.is_some(), |d| {
+            .when(self.map.selected.is_some() || self.map.scope.is_some(), |d| {
                 d.child(toggle("clear", "Clear ✕".into(), false).on_click(cx.listener(
                     |this, _, _, cx| {
-                        this.map.selected = None;
+                        this.map.clear();
                         cx.notify();
                     },
                 )))
@@ -917,33 +917,64 @@ impl Workspace {
             })
             .collect();
         let selected = self.map.selected.as_ref().and_then(|k| graph.find(k));
+        let scope = self.map.scope.as_ref().and_then(|k| graph.find(k));
+        // Inside an artist/label/playlist only its songs are shown; otherwise the filters decide.
+        let shown: Vec<usize> = match scope {
+            Some(group) => graph.songs_of(group),
+            None => self.visible.clone(),
+        };
+        // A subset (group or filter) gets a layout fitted to it; the whole library uses the
+        // library's layout.
+        let subset = shown.len() < graph.song_count();
+        let layout = if subset && !shown.is_empty() { graph.layout_for(&shown) } else { graph.layout };
         // Tempo bins get finer as you zoom in, so a bin is always about a cover wide on screen.
-        let bin = graph
-            .layout
+        let bin = layout
             .bin_for(self.map.transform().scale(), (map::cover_size(self.map.zoom) * 1.3).max(14.0));
+        let signature = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            shown.hash(&mut h);
+            h.finish()
+        };
         let positions = match &self.map.positions {
-            Some((b, g, p)) if *b == bin && Rc::ptr_eq(g, &graph) => p.clone(),
+            Some((b, g, sig, p)) if *b == bin && Rc::ptr_eq(g, &graph) && *sig == signature => {
+                p.clone()
+            }
             _ => {
-                let p = Rc::new(graph.positions(bin));
-                self.map.positions = Some((bin, graph.clone(), p.clone()));
+                let p = Rc::new(graph.positions(&layout, bin));
+                self.map.positions = Some((bin, graph.clone(), signature, p.clone()));
                 p
             }
         };
+        // Highlighting only applies to a song picked inside the view, not to the group itself.
+        let highlight = selected.filter(|_| self.map.selected != self.map.scope);
+        let route_of = selected.filter(|n| matches!(n, NodeId::Playlist(_))).or(scope);
         let (frame, drawn) = Frame::build(
             &graph,
+            layout,
             &positions,
             &keys,
             &arts,
-            &self.visible,
-            selected,
+            &shown,
+            highlight,
+            route_of,
             self.map.hovered,
             &self.map,
             t,
         );
+        let scope_label = scope.map(|n| {
+            let kind = match n {
+                NodeId::Artist(_) => "Artist",
+                NodeId::Label(_) => "Label",
+                NodeId::Playlist(_) => "Playlist",
+                NodeId::Song(_) => "Song",
+            };
+            format!("{kind}: {}  ·  ", graph.name(n))
+        });
         self.map.drawn = drawn;
         let picker = self.map.picker.map(|kind| self.picker(kind, &graph, t, cx));
 
-        let songs = self.visible.len();
+        let songs = shown.len();
         let bounds_cell = self.map.bounds.clone();
         div()
             .id("map")
@@ -994,9 +1025,12 @@ impl Workspace {
                             let key = g.key(NodeId::Song(s));
                             this.map.select(key);
                         }
+                        // Empty space: drop the song selection but stay in the group.
+                        _ if this.map.picker.is_some() => this.map.picker = None,
                         _ => {
-                            this.map.selected = None;
-                            this.map.picker = None;
+                            if this.map.selected != this.map.scope {
+                                this.map.back();
+                            }
                         }
                     }
                     cx.notify();
@@ -1030,7 +1064,8 @@ impl Workspace {
                     .text_xs()
                     .text_color(t.text_muted)
                     .child(format!(
-                        "{songs} songs shown  ·  {}{}",
+                        "{}{songs} songs shown  ·  {}{}",
+                        scope_label.clone().unwrap_or_default(),
                         if self.watcher.is_some() { "● watching" } else { "not watching" },
                         self.notice.as_ref().map(|n| format!("  ·  {n}")).unwrap_or_default()
                     )),
@@ -1269,13 +1304,13 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.open_folder(cx)))
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
-                // Esc peels back one layer: palette, then picker, then selection.
+                // Esc peels back one layer: palette, picker, song selection, then the group.
                 if this.palette.is_some() {
                     this.palette = None;
                 } else if this.map.picker.is_some() {
                     this.map.picker = None;
                 } else {
-                    this.map.selected = None;
+                    this.map.back();
                 }
                 cx.notify();
             }))

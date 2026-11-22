@@ -75,6 +75,9 @@ highlights its songs and dims the rest; they never appear as nodes.
   only the most important (hovered, selected, then the rest) is drawn.
 
 **Selecting**
+- Picking an artist, label or playlist narrows the map to its songs: everything else disappears
+  and both scales refit to the group (its BPM range, only the keys it uses). The previous view
+  is saved; Esc deselects a song inside the group first, then leaves the group and restores it.
 - Click a song: it's highlighted, and the inspector lists its artist, label and playlists as links.
 - Artists ▾ / Labels ▾ / Playlists ▾ chips open a list; picking one highlights its songs.
 - A selected label lists its artists in the inspector (label → artist → songs).

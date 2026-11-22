@@ -38,8 +38,13 @@ pub struct MapState {
     /// Screen-space offset of the world origin from the canvas centre.
     pub pan: Point<Pixels>,
     pub zoom: f32,
-    /// A song, or an artist/label/playlist whose songs are highlighted.
+    /// What the inspector shows: a song, or the artist/label/playlist being viewed.
     pub selected: Option<NodeKey>,
+    /// An artist/label/playlist the map is narrowed to: only its songs are shown, and the
+    /// layout is fitted to them.
+    pub scope: Option<NodeKey>,
+    /// Pan and zoom from before entering a scope, restored when leaving it.
+    pub saved_view: Option<(Point<Pixels>, f32)>,
     /// Song index under the cursor.
     pub hovered: Option<usize>,
     pub drag_from: Option<Point<Pixels>>,
@@ -49,8 +54,8 @@ pub struct MapState {
     pub bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Songs drawn last frame, in paint order.
     pub drawn: Vec<(usize, WorldPoint)>,
-    /// Song positions for a tempo bin width and graph, reused until either changes.
-    pub positions: Option<(f32, Rc<Graph>, Rc<Vec<WorldPoint>>)>,
+    /// Song positions for a (bin width, graph, shown songs) combination, reused until it changes.
+    pub positions: Option<(f32, Rc<Graph>, u64, Rc<Vec<WorldPoint>>)>,
 }
 
 impl Default for MapState {
@@ -59,6 +64,8 @@ impl Default for MapState {
             pan: point(px(0.), px(0.)),
             zoom: 1.0,
             selected: None,
+            scope: None,
+            saved_view: None,
             hovered: None,
             drag_from: None,
             dragged: false,
@@ -135,9 +142,40 @@ impl MapState {
         self.pan = self.pan + (anchor - moved);
     }
 
+    /// Selects a song (highlighted in place), or narrows the map to an artist, label or
+    /// playlist: other songs disappear and the view resets to fit the group.
     pub fn select(&mut self, key: NodeKey) {
-        self.selected = Some(key);
         self.picker = None;
+        if !matches!(key, NodeKey::Song(_)) {
+            if self.saved_view.is_none() {
+                self.saved_view = Some((self.pan, self.zoom));
+            }
+            self.pan = point(px(0.), px(0.));
+            self.zoom = 1.0;
+            self.scope = Some(key.clone());
+        }
+        self.selected = Some(key);
+    }
+
+    /// One step back: deselect a song inside a group, otherwise leave the group.
+    pub fn back(&mut self) {
+        if self.selected.is_some() && self.selected != self.scope {
+            self.selected = self.scope.clone();
+        } else {
+            self.clear();
+        }
+    }
+
+    /// Leaves any group and selection, restoring the view from before.
+    pub fn clear(&mut self) {
+        self.selected = None;
+        self.picker = None;
+        if self.scope.take().is_some() {
+            if let Some((pan, zoom)) = self.saved_view.take() {
+                self.pan = pan;
+                self.zoom = zoom;
+            }
+        }
     }
 }
 
@@ -175,11 +213,13 @@ impl Frame {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         graph: &Graph,
+        layout: MapLayout,
         positions: &[WorldPoint],
         keys: &[Option<Camelot>],
         arts: &[Option<Arc<RenderImage>>],
         shown: &[usize],
         selected: Option<NodeId>,
+        route_of: Option<NodeId>,
         hovered: Option<usize>,
         state: &MapState,
         theme: &Theme,
@@ -243,12 +283,11 @@ impl Frame {
             })
             .collect();
 
-        let route = match selected {
-            Some(NodeId::Playlist(_)) => focus_list.iter().map(|&s| positions[s]).collect(),
+        let route = match route_of {
+            Some(p @ NodeId::Playlist(_)) => graph.songs_of(p).iter().map(|&s| positions[s]).collect(),
             _ => Vec::new(),
         };
 
-        let layout = graph.layout;
         (Self { songs, route, layout, pan: state.pan, zoom: state.zoom, theme: *theme }, drawn)
     }
 
@@ -518,6 +557,34 @@ mod tests {
             (0, r(-5., 25., 15., 35.), 1),  // would cover song 2
         ];
         assert_eq!(place_labels(&labels, &nodes), [false, true, true, false]);
+    }
+
+    #[test]
+    fn groups_narrow_the_view_and_back_restores_it() {
+        let mut s = MapState::default();
+        s.pan = point(px(40.), px(-10.));
+        s.zoom = 3.0;
+        let artist = NodeKey::Artist("Ann".into());
+        let song = NodeKey::Song("/a".into());
+
+        s.select(artist.clone());
+        assert_eq!((s.scope.as_ref(), s.zoom), (Some(&artist), 1.0), "fits the group");
+        s.select(song.clone());
+        assert_eq!(s.scope.as_ref(), Some(&artist), "picking a song stays in the group");
+        assert_eq!(s.selected.as_ref(), Some(&song));
+
+        s.back();
+        assert_eq!(s.selected.as_ref(), Some(&artist), "first Esc deselects the song");
+        s.back();
+        assert_eq!((s.scope.as_ref(), s.selected.as_ref()), (None, None));
+        assert_eq!((s.pan, s.zoom), (point(px(40.), px(-10.)), 3.0), "view restored");
+
+        // Switching groups keeps the original view to return to.
+        s.select(artist);
+        s.zoom = 2.0;
+        s.select(NodeKey::Label("Lab".into()));
+        s.clear();
+        assert_eq!(s.zoom, 3.0);
     }
 
     #[test]

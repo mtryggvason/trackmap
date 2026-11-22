@@ -177,10 +177,17 @@ impl Graph {
         }
     }
 
-    /// Every song's position with tempo grouped into bins of `bin` BPM: x is the bin, y the
-    /// key row, and songs sharing a cell are spread evenly across it (by artist, then title).
-    pub fn positions(&self, bin: f32) -> Vec<Point> {
-        let l = &self.layout;
+    /// A layout fitted to some songs: their tempo range and only the keys they use.
+    pub fn layout_for(&self, songs: &[usize]) -> MapLayout {
+        MapLayout::fit(songs.iter().filter_map(|&s| self.song_tempo[s]))
+            .with_rows(songs.iter().map(|&s| MapLayout::key_row(self.song_key[s])))
+    }
+
+    /// Every song's position in `layout` with tempo grouped into bins of `bin` BPM: x is the
+    /// bin, y the key row, and songs sharing a cell are spread evenly across it (by artist,
+    /// then title).
+    pub fn positions(&self, layout: &MapLayout, bin: f32) -> Vec<Point> {
+        let l = layout;
         let mut cells: BTreeMap<(i64, usize), Vec<usize>> = BTreeMap::new();
         for s in 0..self.song_count() {
             let col = match self.song_tempo[s].filter(|b| b.is_finite() && *b > 0.0) {
@@ -314,7 +321,7 @@ mod tests {
         let g = Graph::build(&tracks, &[]);
 
         // Whole-BPM bins: Zed and Ann share the 124/8A cell, side by side, Ann first.
-        let p = g.positions(1.0);
+        let p = g.positions(&g.layout, 1.0);
         assert_eq!(p[0].y, p[1].y);
         assert!(p[1].x < p[0].x, "Ann before Zed");
         let centre = g.layout.bpm_x(124.0);
@@ -325,9 +332,15 @@ mod tests {
         assert_eq!(p[3].y, g.layout.row_y(crate::KEY_ROWS - 1));
 
         // Zoomed in to 0.1 BPM bins, 124.0 and 124.3 separate and each sits at its own BPM.
-        let p = g.positions(0.1);
+        let p = g.positions(&g.layout, 0.1);
         assert!((p[0].x - g.layout.bpm_x(124.0)).abs() < 1e-3);
         assert!((p[1].x - g.layout.bpm_x(124.3)).abs() < 1e-2);
+
+        // Fitted to Zed and Bob only: one tempo, two keys, so just two rows.
+        let sub = g.layout_for(&[0, 2]);
+        assert_eq!(sub.rows(), [14, 16]);
+        assert!(sub.bpm_min <= 124.0 && sub.bpm_max >= 124.0);
+        assert!(sub.bpm_max - sub.bpm_min <= 20.0);
     }
 
 }

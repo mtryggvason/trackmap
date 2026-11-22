@@ -1609,10 +1609,18 @@ impl Workspace {
                 }),
             )
             .on_pinch(cx.listener(|this, e: &PinchEvent, _, cx| {
+                // While a filter dropdown is open the map stays put.
+                if this.map.picker.is_some() {
+                    return;
+                }
                 this.map.pinch(e.position, e.delta, e.phase, std::time::Instant::now());
                 cx.notify();
             }))
             .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| {
+                // Scrolling a filter dropdown must not pan the map underneath.
+                if this.map.picker.is_some() {
+                    return;
+                }
                 let d = e.delta.pixel_delta(px(16.));
                 if e.modifiers.platform || e.modifiers.control {
                     let factor = (1.0 - f32::from(d.y) * 0.005).clamp(0.5, 2.0);

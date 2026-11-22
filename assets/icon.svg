@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- TrackMap app icon: an orange toy-brick baseplate as a star map, tracks as yellow studs
+       joined by a route, circled by an orbit with a little ship. 80s space-toy style.
+       Generated from a short script in the commit that added it; edit freely by hand. -->
+  <defs>
+    <clipPath id="front"><rect x="0" y="596" width="1024" height="428"/></clipPath>
+    <linearGradient id="space" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1D2B53"/>
+      <stop offset="1" stop-color="#0E1530"/>
+    </linearGradient>
+  </defs>
+
+  <!-- macOS icon body: deep space with a few stars -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#space)"/>
+  <circle cx="214" cy="236" r="6" fill="#F8E8D2" opacity="0.85"/>
+  <circle cx="810" cy="214" r="5" fill="#F8E8D2" opacity="0.85"/>
+  <circle cx="780" cy="300" r="3" fill="#F8E8D2" opacity="0.85"/>
+  <circle cx="248" cy="820" r="4" fill="#F8E8D2" opacity="0.85"/>
+  <circle cx="842" cy="760" r="6" fill="#F8E8D2" opacity="0.85"/>
+  <circle cx="300" cy="180" r="3" fill="#F8E8D2" opacity="0.85"/>
+  <circle cx="176" cy="560" r="3" fill="#F8E8D2" opacity="0.85"/>
+  <circle cx="860" cy="520" r="4" fill="#F8E8D2" opacity="0.85"/>
+  <circle cx="690" cy="170" r="3" fill="#F8E8D2" opacity="0.85"/>
+
+  <g transform="rotate(-12 512 512)">
+    <!-- Orbit, back half -->
+    <ellipse cx="512" cy="596" rx="360" ry="96" fill="none" stroke="#F8E8D2" stroke-width="26"/>
+
+    <!-- Baseplate: side, top -->
+    <rect x="286" y="340" width="452" height="364" rx="34" fill="#C4461F"/>
+    <rect x="286" y="322" width="452" height="364" rx="34" fill="#FF6C37"/>
+
+    <!-- Route between the tracks -->
+    <path d="M 352 392 L 564 496 L 458 600 L 670 600" fill="none" stroke="#F8E8D2" stroke-width="12" stroke-dasharray="4 22" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Studs -->
+      <g>
+        <ellipse cx="357" cy="401" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="352" cy="397" r="33" fill="#C9A21E"/>
+        <circle cx="352" cy="392" r="31" fill="#F2CD37"/>
+        <path d="M 331 386 A 22 22 0 0 1 356 370" fill="none" stroke="#FFF3B0" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="463" cy="401" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="458" cy="397" r="33" fill="#C4461F"/>
+        <circle cx="458" cy="392" r="31" fill="#FF8A5C"/>
+        <path d="M 437 386 A 22 22 0 0 1 462 370" fill="none" stroke="#FFC2A6" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="569" cy="401" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="564" cy="397" r="33" fill="#C4461F"/>
+        <circle cx="564" cy="392" r="31" fill="#FF8A5C"/>
+        <path d="M 543 386 A 22 22 0 0 1 568 370" fill="none" stroke="#FFC2A6" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="675" cy="401" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="670" cy="397" r="33" fill="#C4461F"/>
+        <circle cx="670" cy="392" r="31" fill="#FF8A5C"/>
+        <path d="M 649 386 A 22 22 0 0 1 674 370" fill="none" stroke="#FFC2A6" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="357" cy="505" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="352" cy="501" r="33" fill="#C4461F"/>
+        <circle cx="352" cy="496" r="31" fill="#FF8A5C"/>
+        <path d="M 331 490 A 22 22 0 0 1 356 474" fill="none" stroke="#FFC2A6" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="463" cy="505" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="458" cy="501" r="33" fill="#C4461F"/>
+        <circle cx="458" cy="496" r="31" fill="#FF8A5C"/>
+        <path d="M 437 490 A 22 22 0 0 1 462 474" fill="none" stroke="#FFC2A6" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="569" cy="505" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="564" cy="501" r="33" fill="#C9A21E"/>
+        <circle cx="564" cy="496" r="31" fill="#F2CD37"/>
+        <path d="M 543 490 A 22 22 0 0 1 568 474" fill="none" stroke="#FFF3B0" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="675" cy="505" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="670" cy="501" r="33" fill="#C4461F"/>
+        <circle cx="670" cy="496" r="31" fill="#FF8A5C"/>
+        <path d="M 649 490 A 22 22 0 0 1 674 474" fill="none" stroke="#FFC2A6" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="357" cy="609" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="352" cy="605" r="33" fill="#C4461F"/>
+        <circle cx="352" cy="600" r="31" fill="#FF8A5C"/>
+        <path d="M 331 594 A 22 22 0 0 1 356 578" fill="none" stroke="#FFC2A6" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="463" cy="609" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="458" cy="605" r="33" fill="#C9A21E"/>
+        <circle cx="458" cy="600" r="31" fill="#F2CD37"/>
+        <path d="M 437 594 A 22 22 0 0 1 462 578" fill="none" stroke="#FFF3B0" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="569" cy="609" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="564" cy="605" r="33" fill="#C4461F"/>
+        <circle cx="564" cy="600" r="31" fill="#FF8A5C"/>
+        <path d="M 543 594 A 22 22 0 0 1 568 578" fill="none" stroke="#FFC2A6" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g>
+        <ellipse cx="675" cy="609" rx="34" ry="34" fill="#9E3412" opacity="0.55"/>
+        <circle cx="670" cy="605" r="33" fill="#C9A21E"/>
+        <circle cx="670" cy="600" r="31" fill="#F2CD37"/>
+        <path d="M 649 594 A 22 22 0 0 1 674 578" fill="none" stroke="#FFF3B0" stroke-width="7" stroke-linecap="round"/>
+      </g>
+
+    <!-- Orbit, front half, with a little ship riding on it -->
+    <ellipse cx="512" cy="596" rx="360" ry="96" fill="none" stroke="#F8E8D2" stroke-width="26" clip-path="url(#front)"/>
+    <g transform="translate(818 652) rotate(-24)">
+      <path d="M -34 10 L 0 -22 L 34 10 L 14 4 L 0 16 L -14 4 Z" fill="#F2CD37" stroke="#0E1530" stroke-width="5" stroke-linejoin="round"/>
+      <circle cx="0" cy="-2" r="7" fill="#1D7BC1"/>
+    </g>
+  </g>
+</svg>

@@ -799,12 +799,17 @@ impl Workspace {
                 centered(format!("Could not open {}: {e}", p.display()).into()).into_any_element()
             }
             LibraryState::Loaded(_) if self.view == ViewMode::Map => {
+                // The inspector floats over the map, so opening it doesn't resize the map and
+                // nothing under it moves.
                 return div()
                     .flex_1()
                     .flex()
+                    .relative()
                     .bg(t.bg_app)
                     .child(self.map_view(t, window, cx))
-                    .children(self.inspector(t, cx))
+                    .children(self.inspector(t, cx).map(|panel| {
+                        div().absolute().top_0().right_0().bottom_0().child(panel)
+                    }))
                     .into_any_element();
             }
             LibraryState::Loaded(lib) => self.track_list(lib, t, cx).into_any_element(),
@@ -1257,6 +1262,9 @@ impl Workspace {
                 .bg(t.bg_panel)
                 .border_l_1()
                 .border_color(t.border)
+                .shadow_lg()
+                // Clicks and scrolling in the panel must not reach the map underneath.
+                .occlude()
                 .children(body),
         )
     }

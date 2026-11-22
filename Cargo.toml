@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/graph"]
+members = ["crates/core", "crates/graph", "crates/app"]
 
 [workspace.package]
 edition = "2021"
@@ -9,3 +9,5 @@ license = "MIT"
 
 [workspace.dependencies]
 napworks-core = { path = "crates/core" }
+# runtime_shaders: compile Metal shaders at startup so a full Xcode install is not required.
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }

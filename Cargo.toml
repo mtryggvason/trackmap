@@ -23,3 +23,19 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# Audio decoding and FFT are far too slow unoptimised; optimise them even in dev builds.
+[profile.dev.package.rustfft]
+opt-level = 3
+[profile.dev.package.symphonia-core]
+opt-level = 3
+[profile.dev.package.symphonia-bundle-mp3]
+opt-level = 3
+[profile.dev.package.symphonia-bundle-flac]
+opt-level = 3
+[profile.dev.package.symphonia-codec-pcm]
+opt-level = 3
+[profile.dev.package.symphonia-codec-vorbis]
+opt-level = 3
+[profile.dev.package.trackmap-core]
+opt-level = 2

@@ -63,7 +63,7 @@ fn tag(s: &Option<String>) -> Option<&str> {
 
 impl Graph {
     pub fn build(tracks: &[Track], playlists: &[Playlist]) -> Self {
-        let layout = &MapLayout::fit(tracks.iter().filter_map(|t| t.bpm));
+        let layout = &MapLayout::fit(tracks.iter().filter_map(|t| t.tempo()));
         let mut g = Graph { layout: *layout, ..Graph::default() };
         let (mut artist_ix, mut label_ix) = (HashMap::new(), HashMap::new());
 
@@ -200,7 +200,7 @@ fn song_position(t: &Track, layout: &MapLayout) -> Point {
     let j1 = (bits & 0xFFFF) as f32 / 65535.0 * 2.0 - 1.0;
     let j2 = ((bits >> 16) & 0xFFFF) as f32 / 65535.0 * 2.0 - 1.0;
 
-    let p = layout.position(t.key, t.bpm);
+    let p = layout.position(t.key, t.tempo());
     // Stay well inside the key row; a few world units sideways is a fraction of a BPM.
     Point { x: p.x + j1 * 6.0, y: p.y + j2 * layout.row_height() * 0.35 }
 }

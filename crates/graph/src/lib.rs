@@ -34,14 +34,16 @@ impl Default for MapLayout {
 
 impl MapLayout {
     /// Fits the BPM axis to the library: the range of its tempos, rounded out to 5 BPM.
+    /// With 20+ tracks, the slowest and fastest 2% are ignored (they sit at the edges), so a
+    /// couple of outliers don't squeeze everything else together.
     pub fn fit(bpms: impl IntoIterator<Item = f32>) -> Self {
-        let (lo, hi) = bpms
-            .into_iter()
-            .filter(|b| b.is_finite() && *b > 0.0)
-            .fold((f32::MAX, f32::MIN), |(lo, hi), b| (lo.min(b), hi.max(b)));
-        if lo > hi {
+        let mut v: Vec<f32> = bpms.into_iter().filter(|b| b.is_finite() && *b > 0.0).collect();
+        if v.is_empty() {
             return Self::default();
         }
+        v.sort_by(f32::total_cmp);
+        let trim = if v.len() >= 20 { v.len() / 50 } else { 0 };
+        let (lo, hi) = (v[trim], v[v.len() - 1 - trim]);
         let lo = (lo / 5.0).floor() * 5.0;
         let mut hi = (hi / 5.0).ceil() * 5.0;
         if hi - lo < 20.0 {
@@ -140,6 +142,12 @@ mod tests {
         let wide = MapLayout::fit([88.0, 174.0]);
         assert_eq!((wide.bpm_min, wide.bpm_max), (85.0, 175.0));
         assert_eq!(wide.bpm_ticks().first(), Some(&90.0));
+
+        // One 70 BPM interlude among 99 house tracks doesn't stretch the axis.
+        let mut many = vec![124.0; 99];
+        many.push(70.0);
+        let l = MapLayout::fit(many);
+        assert_eq!((l.bpm_min, l.bpm_max), (120.0, 140.0));
     }
 
     #[test]

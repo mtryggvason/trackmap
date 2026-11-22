@@ -2,6 +2,7 @@ mod map;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use gpui::{
 use map::{Frame, MapState, Picker};
 use theme::Theme;
 use trackmap_core::settings::Settings;
-use trackmap_core::{artwork, playlists, Art, Library, Playlist, Watcher, PLAYLISTS_DIR};
+use trackmap_core::{artwork, playlists, tempo, Art, Library, Playlist, Watcher, PLAYLISTS_DIR};
 use trackmap_graph::{Graph, NodeId};
 
 actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
@@ -62,6 +63,31 @@ struct Workspace {
     /// Decoded cover thumbnails by file name.
     art_images: HashMap<String, Arc<RenderImage>>,
     art_running: bool,
+    tempo_job: Option<TempoJob>,
+}
+
+/// A running "Process BPM" pass.
+struct TempoJob {
+    done: usize,
+    total: usize,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Analyses tracks in parallel on a few threads. Returns (path, detected BPM) pairs.
+fn detect_tempos(paths: Vec<PathBuf>) -> Vec<(PathBuf, Option<f32>)> {
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 6);
+    let chunk = paths.len().div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = paths
+            .chunks(chunk)
+            .map(|c| {
+                s.spawn(move || {
+                    c.iter().map(|p| (p.clone(), tempo::detect_file(p))).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    })
 }
 
 /// Covers looked up per background step, so they appear progressively.
@@ -97,6 +123,74 @@ impl Workspace {
             view: ViewMode::Map,
             art_images: HashMap::new(),
             art_running: false,
+            tempo_job: None,
+        }
+    }
+
+    /// Detects BPM for every track without one, a few at a time, updating the map as it goes.
+    fn start_tempo(&mut self, cx: &mut Context<Self>) {
+        if self.tempo_job.is_some() {
+            return;
+        }
+        let LibraryState::Loaded(lib) = &self.library else { return };
+        let todo = tempo::pending(&lib.tracks);
+        if todo.is_empty() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.tempo_job = Some(TempoJob { done: 0, total: todo.len(), cancel: cancel.clone() });
+        let generation = self.generation;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let batch = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 6) * 2;
+            for chunk in todo.chunks(batch) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let paths = chunk.to_vec();
+                let results =
+                    cx.background_executor().spawn(async move { detect_tempos(paths) }).await;
+                let keep_going = this.update(cx, |ws, cx| {
+                    if ws.generation != generation {
+                        return false;
+                    }
+                    let LibraryState::Loaded(lib) = &mut ws.library else { return false };
+                    let n = results.len();
+                    lib.set_tempo(results);
+                    if let Some(job) = &mut ws.tempo_job {
+                        job.done += n;
+                    }
+                    ws.rebuild_graph();
+                    cx.notify();
+                    true
+                });
+                if !matches!(keep_going, Ok(true)) {
+                    return;
+                }
+            }
+            let snapshot = this.update(cx, |ws, cx| {
+                ws.tempo_job = None;
+                cx.notify();
+                match &ws.library {
+                    LibraryState::Loaded(lib) if ws.generation == generation => Some(lib.clone()),
+                    _ => None,
+                }
+            });
+            if let Ok(Some(lib)) = snapshot {
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = trackmap_core::cache::save(&lib);
+                    })
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    fn stop_tempo(&mut self) {
+        if let Some(job) = self.tempo_job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
         }
     }
 
@@ -238,6 +332,7 @@ impl Workspace {
         self.map = MapState::default();
         self.art_images.clear();
         self.art_running = false;
+        self.stop_tempo();
         self.library = LibraryState::Scanning(root.clone());
         cx.notify();
 
@@ -470,6 +565,7 @@ impl Workspace {
                         ),
                     ),
             )
+            .children(self.process_button(t, cx))
             .child(
                 div()
                     .px_3()
@@ -480,6 +576,38 @@ impl Workspace {
                     .text_color(t.bg_app)
                     .child("Sync ⇪"),
             )
+    }
+
+    /// "Process BPM (n)" while tracks lack a tempo; progress (click to stop) while running.
+    fn process_button(&self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let base = div()
+            .id("process")
+            .px_3()
+            .py_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .border_1()
+            .border_color(t.accent);
+        if let Some(job) = &self.tempo_job {
+            return Some(
+                base.text_color(t.accent)
+                    .child(format!("Processing {}/{}  ✕", job.done, job.total))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.stop_tempo();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let LibraryState::Loaded(lib) = &self.library else { return None };
+        let n = tempo::pending(&lib.tracks).len();
+        (n > 0).then(|| {
+            base.text_color(t.text)
+                .hover(|s| s.bg(t.bg_elevated))
+                .child(format!("Process BPM ({n})"))
+                .on_click(cx.listener(|this, _, _, cx| this.start_tempo(cx)))
+                .into_any_element()
+        })
     }
 
     fn canvas_area(&mut self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -594,7 +722,7 @@ impl Workspace {
                                             .child(tr.label.clone().unwrap_or_else(dash)),
                                     )
                                     .child(div().w(px(60.)).text_color(t.text_muted).child(
-                                        tr.bpm.map(|b| format!("{b:.0}")).unwrap_or_else(dash),
+                                        tr.tempo().map(|b| format!("{b:.0}")).unwrap_or_else(dash),
                                     ))
                                     .child(div().w(px(40.)).text_color(t.accent).child(
                                         tr.key.map(|k| k.to_string()).unwrap_or_default(),
@@ -823,8 +951,9 @@ impl Workspace {
                 let mut rows = vec![div()
                     .text_color(t.text_muted)
                     .child(format!(
-                        "{} BPM  ·  {}",
-                        tr.bpm.map(|b| format!("{b:.0}")).unwrap_or_else(|| "—".into()),
+                        "{} BPM{}  ·  {}",
+                        tr.tempo().map(|b| format!("{b:.0}")).unwrap_or_else(|| "—".into()),
+                        if tr.tempo_is_detected() { " (detected)" } else { "" },
                         tr.key.map(|k| k.to_string()).unwrap_or_else(|| "no key".into())
                     ))
                     .into_any_element()];

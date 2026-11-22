@@ -7,6 +7,7 @@ pub mod key;
 pub mod playlists;
 pub mod scan;
 pub mod settings;
+pub mod tempo;
 pub mod watch;
 
 use std::path::{Component, Path, PathBuf};
@@ -75,6 +76,24 @@ pub struct Track {
     /// Cover thumbnail, looked up in the background after scanning.
     #[serde(default)]
     pub art: Art,
+    /// BPM found by audio analysis, for tracks without one in their tags.
+    #[serde(default)]
+    pub detected_bpm: Option<f32>,
+    /// Whether audio analysis has run (even if it found nothing).
+    #[serde(default)]
+    pub analyzed: bool,
+}
+
+impl Track {
+    /// The BPM to use: from the tags if present, otherwise the detected one.
+    pub fn tempo(&self) -> Option<f32> {
+        self.bpm.or(self.detected_bpm)
+    }
+
+    /// Whether the tempo came from analysis rather than the file's tags.
+    pub fn tempo_is_detected(&self) -> bool {
+        self.bpm.is_none() && self.detected_bpm.is_some()
+    }
 }
 
 #[cfg(test)]

@@ -28,6 +28,17 @@ impl Library {
         }
     }
 
+    /// Records tempo analysis results. Tracks that have since disappeared are ignored.
+    pub fn set_tempo(&mut self, results: Vec<(PathBuf, Option<f32>)>) {
+        let mut by_path: HashMap<PathBuf, Option<f32>> = results.into_iter().collect();
+        for t in &mut self.tracks {
+            if let Some(bpm) = by_path.remove(&t.path) {
+                t.detected_bpm = bpm;
+                t.analyzed = true;
+            }
+        }
+    }
+
     pub fn artist_count(&self) -> usize {
         distinct(self.tracks.iter().filter_map(|t| t.artist.as_deref()))
     }

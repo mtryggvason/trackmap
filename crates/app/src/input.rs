@@ -91,6 +91,13 @@ impl TextInput {
         &self.content
     }
 
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.content = "".into();
+        self.selected_range = 0..0;
+        self.marked_range = None;
+        cx.notify();
+    }
+
     pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
         self.selected_range = 0..self.content.len();
         cx.notify();

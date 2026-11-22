@@ -120,7 +120,8 @@ highlights its songs and dims the rest; they never appear as nodes.
   search songs, artists, albums, labels and playlists (every word must match, any order,
   accents ignored); the map previews matches while it's open. Enter opens a result (song
   selected, group narrows the map); the first row, "Show N matching songs on the map", keeps
-  the query as a map filter. Esc / clicking outside closes and restores the map. The top-bar
+  the query as a map filter. Esc / clicking outside closes and keeps the search on the map
+  (✕ in the top bar, or emptying the field, clears it). The top-bar
   box works like VS Code's command centre: it opens Quick Open and shows an active filter
   with ✕. Each track's search text is prepared once, so a keystroke scans 20,000 tracks in
   under 1 ms.

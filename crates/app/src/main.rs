@@ -729,9 +729,18 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Closes Quick Open, keeping what was typed as the map's filter (an empty query clears it).
     fn close_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter = self.query.clone();
         self.quick_open = false;
         window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Removes the search filter and empties the search field.
+    fn clear_filter(&mut self, cx: &mut Context<Self>) {
+        self.filter = Default::default();
+        self.search.update(cx, |s, cx| s.clear(cx));
         cx.notify();
     }
 
@@ -793,17 +802,17 @@ impl Workspace {
         let Some(hit) = hits.get(index) else { return };
         match (hit.node, self.graph.clone()) {
             (None, _) => {
-                self.filter = self.query.clone();
                 self.map.clear();
+                self.close_quick_open(window, cx);
             }
             (Some(node), Some(graph)) => {
-                // Make sure what we jump to isn't hidden by an older filter.
-                self.filter = Default::default();
+                // Jump straight to it, without a filter that might hide it.
                 self.map.select(graph.key(node));
+                self.close_quick_open(window, cx);
+                self.clear_filter(cx);
             }
             _ => {}
         }
-        self.close_quick_open(window, cx);
     }
 
     /// The ⌘P panel: a search field with results below, floating at the top centre like VS Code.
@@ -904,7 +913,7 @@ impl Workspace {
                                 .border_color(t.border)
                                 .text_xs()
                                 .text_color(t.text_muted)
-                                .child("↑ ↓ to choose  ·  Enter to open  ·  Esc to close"),
+                                .child("↑ ↓ to choose  ·  Enter to open  ·  Esc to close (the search stays on the map)"),
                         ),
                 ),
             )
@@ -1130,7 +1139,7 @@ impl Workspace {
                                 .child("✕")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.filter = Default::default();
+                                    this.clear_filter(cx);
                                     cx.notify();
                                 })),
                         )
@@ -2153,7 +2162,7 @@ impl Render for Workspace {
                 } else if this.map.picker.is_some() {
                     this.map.picker = None;
                 } else if this.map.selected.is_none() && this.map.scope.is_none() && !this.filter.is_empty() {
-                    this.filter = Default::default();
+                    this.clear_filter(cx);
                 } else {
                     this.map.back();
                 }

@@ -24,7 +24,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
 /// Name of the folder under the library root whose subfolders are playlists.
 pub const PLAYLISTS_DIR: &str = "Playlists";
 
-/// Whether `path` is part of the library at `root`: inside it, not hidden (e.g. `.napworks/`),
+/// Whether `path` is part of the library at `root`: inside it, not hidden (e.g. `.trackmap/`),
 /// and not in the top-level `Playlists/` folder, whose entries link to tracks already counted.
 pub fn is_library_path(root: &Path, path: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(root) else { return false };
@@ -94,7 +94,7 @@ mod tests {
         assert!(is_library_path(root, Path::new("/lib/House/a.mp3")));
         assert!(is_library_path(root, Path::new("/lib/House/Playlists/a.mp3")));
         assert!(!is_library_path(root, Path::new("/lib/Playlists/Warmup/a.mp3")));
-        assert!(!is_library_path(root, Path::new("/lib/.napworks/library.json")));
+        assert!(!is_library_path(root, Path::new("/lib/.trackmap/library.json")));
         assert!(!is_library_path(root, Path::new("/lib/House/.a.mp3")));
         assert!(!is_library_path(root, Path::new("/other/a.mp3")));
         assert!(!is_library_path(root, root));

@@ -203,7 +203,7 @@ mod tests {
             &root,
             [
                 root.join(PLAYLISTS_DIR).join("Warmup/x.mp3"),
-                root.join(".napworks/library.json"),
+                root.join(".trackmap/library.json"),
                 root.join("cover.jpg"),
                 PathBuf::from("/elsewhere/x.mp3"),
             ],

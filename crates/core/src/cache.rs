@@ -1,4 +1,4 @@
-//! Per-library cache at `<root>/.napworks/library.json`.
+//! Per-library cache at `<root>/.trackmap/library.json`.
 //!
 //! Paths are stored relative to the root, so the cache survives the library moving
 //! (e.g. a drive mounted under a different name).
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Library, Track};
 
-pub const CACHE_DIR: &str = ".napworks";
+pub const CACHE_DIR: &str = ".trackmap";
 const CACHE_FILE: &str = "library.json";
 const VERSION: u32 = 1;
 

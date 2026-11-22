@@ -1,6 +1,6 @@
-# nap.works file manager — plan
+# TrackMap — plan
 
-A Rekordbox alternative for organising music for the nap.works **Devious Pocket**.
+TrackMap is a Rekordbox alternative for organising music for the nap.works **Devious Pocket**.
 Written in Rust with GPUI. Graph-based UI where songs, artists, labels and playlists are nodes.
 
 ## What the player expects (facts we design around)
@@ -27,7 +27,7 @@ with a BOM, header row `#  Track Title  Artist  …  BPM  Key …`, and files at
 - **`<root>/Playlists/`**: every subfolder is a playlist, and its entries are **symlinks** to library
   files (APFS supports them). Folders created in Finder become playlists and vice versa. The scanner
   skips `Playlists/` so tracks aren't counted twice.
-- **`<root>/.napworks/library.db`**: SQLite cache of tags, analysis and waveform peaks, keyed by
+- **`<root>/.trackmap/library.db`**: SQLite cache of tags, analysis and waveform peaks, keyed by
   path + content hash so moves and renames keep their data.
 - **Sync to USB**: writes the layout the player expects.
   ```
@@ -133,7 +133,7 @@ nodes are orange, with their edges orange and everything else dimmed to about 30
 
 0. **Device check:** get a real Rekordbox `.txt` export and the stick layout. Optionally test whether
    the Pocket follows symlinks on EXT4 (not required).
-1. **Core:** open a folder, scan, read tags, SQLite cache. CLI: `napworks scan <dir>`.
+1. **Core:** open a folder, scan, read tags, SQLite cache. CLI: `trackmap scan <dir>`.
 2. **Watcher:** debounced events kept in sync with the DB, plus a startup reconciliation scan.
 3. **Playlists:** symlink folders in `Playlists/` (create/rename/delete, Finder edits reflected).
 4. **GPUI shell:** theme, top bar, filters, ⌘P palette, inspector, preview playback.

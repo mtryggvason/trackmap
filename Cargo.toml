@@ -8,6 +8,6 @@ version = "0.1.0"
 license = "MIT"
 
 [workspace.dependencies]
-napworks-core = { path = "crates/core" }
+trackmap-core = { path = "crates/core" }
 # runtime_shaders: compile Metal shaders at startup so a full Xcode install is not required.
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }

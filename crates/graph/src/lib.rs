@@ -1,6 +1,6 @@
 //! Graph model and layout. Pure data, no rendering.
 
-use napworks_core::Camelot;
+use trackmap_core::Camelot;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {

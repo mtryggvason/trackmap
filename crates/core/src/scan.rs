@@ -245,14 +245,14 @@ pub(crate) mod tests {
         let root = dir.path();
         fs::create_dir_all(root.join("House/Deep")).unwrap();
         fs::create_dir_all(root.join(PLAYLISTS_DIR).join("Warmup")).unwrap();
-        fs::create_dir_all(root.join(".napworks")).unwrap();
+        fs::create_dir_all(root.join(".trackmap")).unwrap();
 
         write_tagged_wav(&root.join("House/Deep/a.wav"), "A");
         fs::write(root.join("House/b.mp3"), b"x").unwrap();
         fs::write(root.join("House/cover.jpg"), b"x").unwrap();
         fs::write(root.join("House/c.m4a"), b"x").unwrap();
         fs::write(root.join(PLAYLISTS_DIR).join("Warmup/a.wav"), b"x").unwrap();
-        fs::write(root.join(".napworks/hidden.mp3"), b"x").unwrap();
+        fs::write(root.join(".trackmap/hidden.mp3"), b"x").unwrap();
         fs::write(root.join("House/.hidden.mp3"), b"x").unwrap();
 
         let lib = scan(root).unwrap();

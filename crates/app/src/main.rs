@@ -11,11 +11,11 @@ use gpui::{
     FocusHandle, KeyBinding, PathPromptOptions, SharedString, TitlebarOptions, Window,
     WindowBounds, WindowOptions,
 };
-use napworks_core::settings::Settings;
-use napworks_core::{Library, Watcher};
+use trackmap_core::settings::Settings;
+use trackmap_core::{Library, Watcher};
 use theme::Theme;
 
-actions!(napworks, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
+actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
 
 enum LibraryState {
     Empty,
@@ -45,7 +45,7 @@ struct Workspace {
 }
 
 fn settings_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("napworks").join("settings.json"))
+    dirs::config_dir().map(|d| d.join("TrackMap").join("settings.json"))
 }
 
 impl Workspace {
@@ -90,7 +90,7 @@ impl Workspace {
             let scan_root = root.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { napworks_core::open(&scan_root) })
+                .spawn(async move { trackmap_core::open(&scan_root) })
                 .await;
 
             this.update(cx, |ws, cx| {
@@ -118,12 +118,12 @@ impl Workspace {
         let LibraryState::Loaded(lib) = &self.library else { return };
         let root = lib.root.clone();
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<Vec<PathBuf>>();
-        match napworks_core::watch(&root, move |paths| {
+        match trackmap_core::watch(&root, move |paths| {
             let _ = tx.unbounded_send(paths);
         }) {
             Ok(w) => self.watcher = Some(w),
             Err(e) => {
-                eprintln!("napworks: not watching {}: {e}", root.display());
+                eprintln!("trackmap: not watching {}: {e}", root.display());
                 return;
             }
         }
@@ -137,7 +137,7 @@ impl Workspace {
                 let changes_root = root.clone();
                 let changes = cx
                     .background_executor()
-                    .spawn(async move { napworks_core::changes_for(&changes_root, paths) })
+                    .spawn(async move { trackmap_core::changes_for(&changes_root, paths) })
                     .await;
                 if changes.is_empty() {
                     continue;
@@ -156,7 +156,7 @@ impl Workspace {
                 let Ok(Some(lib)) = snapshot else { break };
                 cx.background_executor()
                     .spawn(async move {
-                        let _ = napworks_core::cache::save(&lib);
+                        let _ = trackmap_core::cache::save(&lib);
                     })
                     .await;
             }
@@ -461,7 +461,7 @@ fn remember_library(root: &std::path::Path) {
     let mut settings = Settings::load(&path);
     settings.last_library = Some(root.to_path_buf());
     if let Err(e) = settings.save(&path) {
-        eprintln!("napworks: could not save settings: {e}");
+        eprintln!("trackmap: could not save settings: {e}");
     }
 }
 
@@ -483,7 +483,7 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("napworks".into()),
+                        title: Some("TrackMap".into()),
                         appears_transparent: true,
                         traffic_light_position: Some(point(px(12.), px(13.))),
                     }),
@@ -492,7 +492,7 @@ fn main() {
                 |_, cx| {
                     cx.new(|cx| {
                         let mut ws = Workspace::new(cx);
-                        // `napworks <folder>` opens that folder; otherwise reopen the last one.
+                        // `trackmap <folder>` opens that folder; otherwise reopen the last one.
                         let root = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| {
                             let s = Settings::load(&settings_path()?);
                             s.last_library.filter(|p| p.is_dir())

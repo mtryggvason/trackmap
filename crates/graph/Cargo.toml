@@ -1,0 +1,8 @@
+[package]
+name = "napworks-graph"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+napworks-core.workspace = true

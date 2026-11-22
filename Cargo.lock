@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "napworks-core"
 version = "0.1.0"
+
+[[package]]
+name = "napworks-graph"
+version = "0.1.0"
+dependencies = [
+ "napworks-core",
+]

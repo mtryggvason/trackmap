@@ -720,30 +720,45 @@ impl Workspace {
                 .border_1()
                 .border_color(t.accent)
         };
-        if let Some(job) = &self.analysis {
-            return vec![base("process")
-                .text_color(t.accent)
-                .child(format!("Processing {} {}/{}  ✕", job.kind.label(), job.done, job.total))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.stop_analysis();
-                    cx.notify();
-                }))
-                .into_any_element()];
-        }
         let LibraryState::Loaded(lib) = &self.library else { return Vec::new() };
         let mut out = Vec::new();
+        // BPM and Key always sit side by side: progress on the running one, the other greyed
+        // out while it runs, and a tick once there's nothing left to process.
         for (kind, id) in [(Analysis::Bpm, "process-bpm"), (Analysis::Key, "process-key")] {
-            let n = kind.pending(lib).len();
-            if n > 0 {
-                out.push(
-                    base(id)
-                        .text_color(t.text)
-                        .hover(|s| s.bg(t.bg_elevated))
-                        .child(format!("Process {} ({n})", kind.label()))
-                        .on_click(cx.listener(move |this, _, _, cx| this.start_analysis(kind, cx)))
-                        .into_any_element(),
-                );
-            }
+            let button = match &self.analysis {
+                Some(job) if job.kind == kind => base(id)
+                    .text_color(t.accent)
+                    .child(format!("Processing {} {}/{}  ✕", kind.label(), job.done, job.total))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.stop_analysis();
+                        cx.notify();
+                    })),
+                _ => {
+                    let n = kind.pending(lib).len();
+                    if n == 0 {
+                        base(id)
+                            .cursor_default()
+                            .border_color(t.border)
+                            .text_color(t.text_muted)
+                            .child(format!("{} ✓", kind.label()))
+                    } else if self.analysis.is_some() {
+                        base(id)
+                            .cursor_default()
+                            .border_color(t.border)
+                            .text_color(t.text_muted)
+                            .child(format!("Process {} ({n})", kind.label()))
+                    } else {
+                        base(id)
+                            .text_color(t.text)
+                            .hover(|s| s.bg(t.bg_elevated))
+                            .child(format!("Process {} ({n})", kind.label()))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.start_analysis(kind, cx)),
+                            )
+                    }
+                }
+            };
+            out.push(button.into_any_element());
         }
         if self.writing_tags {
             out.push(base("write-tags").text_color(t.text_muted).child("Writing tags…").into_any_element());

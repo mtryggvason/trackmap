@@ -912,7 +912,7 @@ impl Workspace {
                 uniform_list(
                     "tracks",
                     self.visible.len(),
-                    cx.processor(move |this, range: Range<usize>, _, _| {
+                    cx.processor(move |this, range: Range<usize>, _, cx| {
                         let LibraryState::Loaded(lib) = &this.library else { return Vec::new() };
                         range
                             .filter_map(|row| this.visible.get(row).map(|&i| (row, i)))
@@ -920,6 +920,8 @@ impl Workspace {
                                 let tr = &lib.tracks[i];
                                 let is_new = this.new_tracks.contains(&tr.path);
                                 let dash = || "—".to_string();
+                                let path = tr.path.clone();
+                                let is_selected = this.selected_song().as_ref() == Some(&tr.path);
                                 div()
                                     .id(row)
                                     .flex()
@@ -927,7 +929,17 @@ impl Workspace {
                                     .px_3()
                                     .h(px(26.))
                                     .items_center()
+                                    .cursor_pointer()
+                                    .when(is_selected, |d| d.bg(t.bg_elevated))
                                     .hover(|s| s.bg(t.bg_elevated))
+                                    // Click selects (Space then plays); double-click plays.
+                                    .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                                        this.map.selected = Some(trackmap_graph::NodeKey::Song(path.clone()));
+                                        if e.click_count() >= 2 {
+                                            this.play_song(&path, cx);
+                                        }
+                                        cx.notify();
+                                    }))
                                     .child(
                                         div()
                                             .w(px(36.))
@@ -1125,6 +1137,11 @@ impl Workspace {
                         (Some(s), Some(g)) => {
                             let key = g.key(NodeId::Song(s));
                             this.map.select(key);
+                            // Double-click plays it.
+                            if e.click_count >= 2 {
+                                let path = g.song_paths[s].clone();
+                                this.play_song(&path, cx);
+                            }
                         }
                         // Empty space: drop the song selection but stay in the group.
                         _ if this.map.picker.is_some() => this.map.picker = None,

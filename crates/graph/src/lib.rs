@@ -1,5 +1,8 @@
 //! Graph model and layout. Pure data, no rendering.
 
+mod model;
+
+pub use model::{Graph, NodeId};
 use trackmap_core::Camelot;
 
 #[derive(Debug, Clone, Copy, PartialEq)]

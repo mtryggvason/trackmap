@@ -1,3 +1,4 @@
+mod input;
 mod map;
 mod player;
 mod theme;
@@ -12,7 +13,7 @@ use std::rc::Rc;
 use futures::StreamExt;
 
 use gpui::{
-    actions, canvas, div, relative, point, prelude::*, px, size, uniform_list, AnyElement, App,
+    actions, canvas, div, relative, Focusable, point, prelude::*, px, size, uniform_list, AnyElement, App,
     Bounds, Context, FocusHandle, KeyBinding, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, PinchEvent, RenderImage, ScrollEvent,
     SharedString,
@@ -27,7 +28,21 @@ use trackmap_core::{
 };
 use trackmap_graph::{Graph, NodeId};
 
-actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit, TogglePlay, SkipBack, SkipForward]);
+actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit, TogglePlay, SkipBack, SkipForward, Confirm]);
+
+/// What a name prompt is for.
+#[derive(Clone)]
+enum PromptKind {
+    /// Create a playlist, adding this song to it if set.
+    NewPlaylist { add: Option<PathBuf> },
+    /// Rename this playlist.
+    Rename(String),
+}
+
+struct NamePrompt {
+    kind: PromptKind,
+    input: gpui::Entity<input::TextInput>,
+}
 
 enum LibraryState {
     Empty,
@@ -77,6 +92,12 @@ struct Workspace {
     ticking: bool,
     /// Preview bar's progress track, for turning clicks into seek positions.
     progress_bounds: Rc<std::cell::Cell<Bounds<gpui::Pixels>>>,
+    /// The name prompt (new / rename playlist), when open.
+    prompt: Option<NamePrompt>,
+    /// The song inspector's "Add to playlist" list is open.
+    adding_to_playlist: bool,
+    /// A playlist whose Delete button was clicked once and awaits confirmation.
+    confirm_delete: Option<String>,
 }
 
 /// What a "Process …" button analyses.
@@ -174,7 +195,140 @@ impl Workspace {
             player: player::Player::default(),
             ticking: false,
             progress_bounds: Rc::new(std::cell::Cell::new(Bounds::default())),
+            prompt: None,
+            adding_to_playlist: false,
+            confirm_delete: None,
         }
+    }
+
+    fn library_root(&self) -> Option<PathBuf> {
+        match &self.library {
+            LibraryState::Loaded(lib) => Some(lib.root.clone()),
+            _ => None,
+        }
+    }
+
+    /// Re-reads the playlists from disk right away (the watcher also does, a moment later).
+    fn reload_playlists(&mut self) {
+        if let Some(root) = self.library_root() {
+            self.playlists = playlists::list(&root).unwrap_or_default();
+            self.rebuild_graph();
+        }
+    }
+
+    /// Runs a playlist change, then shows any error and refreshes.
+    fn playlist_op(&mut self, op: impl FnOnce(&std::path::Path) -> std::io::Result<()>, cx: &mut Context<Self>) {
+        let Some(root) = self.library_root() else { return };
+        if let Err(e) = op(&root) {
+            self.notice = Some(format!("Playlist: {e}").into());
+        }
+        self.reload_playlists();
+        cx.notify();
+    }
+
+    fn open_prompt(&mut self, kind: PromptKind, window: &mut Window, cx: &mut Context<Self>) {
+        let (placeholder, text) = match &kind {
+            PromptKind::NewPlaylist { .. } => ("Playlist name", String::new()),
+            PromptKind::Rename(name) => ("New name", name.clone()),
+        };
+        let input = cx.new(|cx| input::TextInput::new(placeholder, &text, cx));
+        let handle = input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.map.picker = None;
+        self.prompt = Some(NamePrompt { kind, input });
+        cx.notify();
+    }
+
+    fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt = None;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Enter in the name prompt: create or rename the playlist.
+    fn confirm_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = &self.prompt else { return };
+        let name = prompt.input.read(cx).text().trim().to_string();
+        let kind = prompt.kind.clone();
+        let Some(root) = self.library_root() else { return };
+        let result = match &kind {
+            PromptKind::NewPlaylist { add } => playlists::create(&root, &name).and_then(|_| match add {
+                Some(song) => playlists::add(&root, &name, song).map(|_| ()),
+                None => Ok(()),
+            }),
+            PromptKind::Rename(old) if *old == name => Ok(()),
+            PromptKind::Rename(old) => playlists::rename(&root, old, &name),
+        };
+        match result {
+            Ok(()) => {
+                self.close_prompt(window, cx);
+                self.reload_playlists();
+                let key = trackmap_graph::NodeKey::Playlist(name.clone());
+                match kind {
+                    // Keep viewing the playlist under its new name.
+                    PromptKind::Rename(old) => {
+                        let was = Some(trackmap_graph::NodeKey::Playlist(old));
+                        if self.map.scope == was {
+                            self.map.scope = Some(key.clone());
+                        }
+                        if self.map.selected == was {
+                            self.map.selected = Some(key);
+                        }
+                    }
+                    PromptKind::NewPlaylist { .. } => self.notice = Some(format!("Created playlist {name}").into()),
+                }
+            }
+            // Keep the prompt open so the name can be fixed.
+            Err(e) => self.notice = Some(format!("Playlist: {e}").into()),
+        }
+        cx.notify();
+    }
+
+    /// Moves a song up (-1) or down (+1) in a playlist.
+    fn move_in_playlist(&mut self, name: &str, song: &std::path::Path, delta: i32, cx: &mut Context<Self>) {
+        let Some(pl) = self.playlists.iter().find(|p| p.name == name) else { return };
+        let mut order: Vec<PathBuf> = pl.entries.iter().map(|e| e.target.clone()).collect();
+        let Some(i) = order.iter().position(|p| p == song) else { return };
+        let j = i as i32 + delta;
+        if j < 0 || j as usize >= order.len() {
+            return;
+        }
+        order.swap(i, j as usize);
+        let name = name.to_string();
+        self.playlist_op(move |root| playlists::reorder(root, &name, &order), cx);
+    }
+
+    fn prompt_view(&self, prompt: &NamePrompt, t: &Theme) -> impl IntoElement {
+        let title = match &prompt.kind {
+            PromptKind::NewPlaylist { add: Some(_) } => "New playlist with the selected song",
+            PromptKind::NewPlaylist { add: None } => "New playlist",
+            PromptKind::Rename(_) => "Rename playlist",
+        };
+        div().absolute().size_full().flex().justify_center().pt(px(80.)).child(
+            div()
+                .w(px(420.))
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded_lg()
+                .bg(t.bg_elevated)
+                .border_1()
+                .border_color(t.accent)
+                .shadow_lg()
+                .child(div().text_xs().text_color(t.text_muted).child(title))
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(t.bg_app)
+                        .border_1()
+                        .border_color(t.border)
+                        .child(prompt.input.clone()),
+                )
+                .child(div().text_xs().text_color(t.text_muted).child("Enter to save  ·  Esc to cancel")),
+        )
     }
 
     /// The song picked on the map, if any.
@@ -1234,6 +1388,22 @@ impl Workspace {
             // Clicks inside the list must not reach the map underneath.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(kind == Picker::Playlists, |d| {
+                d.child(
+                    div()
+                        .id("new-playlist")
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .text_color(t.accent)
+                        .hover(|s| s.bg(t.bg_panel))
+                        .child("+ New playlist…")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let add = this.selected_song();
+                            this.open_prompt(PromptKind::NewPlaylist { add }, window, cx);
+                        })),
+                )
+            })
             .when(empty, |d| {
                 d.child(div().px_3().py_1().text_color(t.text_muted).child("None yet"))
             })
@@ -1337,6 +1507,70 @@ impl Workspace {
                 for (j, &p) in graph.playlists_of(i).iter().enumerate() {
                     rows.push(link(10 + j, NodeId::Playlist(p), cx).into_any_element());
                 }
+                rows.push(
+                    div()
+                        .id("add-to-playlist")
+                        .mt_1()
+                        .cursor_pointer()
+                        .text_color(t.accent)
+                        .child(if self.adding_to_playlist { "− Add to playlist" } else { "+ Add to playlist" })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.adding_to_playlist = !this.adding_to_playlist;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+                if self.adding_to_playlist {
+                    let member: HashSet<usize> = graph.playlists_of(i).iter().copied().collect();
+                    let mut names: Vec<(usize, String)> = graph.playlists.iter().cloned().enumerate().collect();
+                    names.sort_by_key(|(_, n)| n.to_lowercase());
+                    for (j, (p, name)) in names.into_iter().enumerate() {
+                        let is_member = member.contains(&p);
+                        let song = tr.path.clone();
+                        rows.push(
+                            div()
+                                .id(("toggle-pl", j))
+                                .flex()
+                                .gap_2()
+                                .pl_2()
+                                .py_0p5()
+                                .cursor_pointer()
+                                .text_color(if is_member { t.text } else { t.text_muted })
+                                .hover(|s| s.text_color(t.accent))
+                                .child(div().w(px(14.)).text_color(t.accent).child(if is_member { "✓" } else { "" }))
+                                .child(name.clone())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let (name, song) = (name.clone(), song.clone());
+                                    this.playlist_op(
+                                        move |root| {
+                                            if is_member {
+                                                playlists::remove(root, &name, &song).map(|_| ())
+                                            } else {
+                                                playlists::add(root, &name, &song).map(|_| ())
+                                            }
+                                        },
+                                        cx,
+                                    );
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    let song = tr.path.clone();
+                    rows.push(
+                        div()
+                            .id("new-pl-with-song")
+                            .pl_2()
+                            .py_0p5()
+                            .cursor_pointer()
+                            .text_color(t.text_muted)
+                            .hover(|s| s.text_color(t.accent))
+                            .child("New playlist…")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_prompt(PromptKind::NewPlaylist { add: Some(song.clone()) }, window, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 let rel = tr.path.strip_prefix(&lib.root).unwrap_or(&tr.path);
                 rows.push(heading("File").into_any_element());
                 rows.push(
@@ -1344,6 +1578,91 @@ impl Workspace {
                         .into_any_element(),
                 );
                 ("Song", rows)
+            }
+            NodeId::Playlist(p) => {
+                let name = graph.playlists[p].clone();
+                let songs = graph.songs_of(sel);
+                let button = |id: &'static str, label: String| {
+                    div()
+                        .id(id)
+                        .px_2()
+                        .py_0p5()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(t.bg_elevated)
+                        .hover(|s| s.bg(t.border))
+                        .child(label)
+                };
+                let confirming = self.confirm_delete.as_deref() == Some(name.as_str());
+                let (n1, n2) = (name.clone(), name.clone());
+                let mut rows = vec![div()
+                    .mt_2()
+                    .flex()
+                    .gap_2()
+                    .child(button("rename-pl", "Rename".into()).text_color(t.text).on_click(cx.listener(
+                        move |this, _, window, cx| this.open_prompt(PromptKind::Rename(n1.clone()), window, cx),
+                    )))
+                    .child(
+                        button("delete-pl", if confirming { "Really delete?".into() } else { "Delete".into() })
+                            .text_color(if confirming { t.accent } else { t.text })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.confirm_delete.as_deref() == Some(n2.as_str()) {
+                                    this.confirm_delete = None;
+                                    let name = n2.clone();
+                                    this.playlist_op(move |root| playlists::delete(root, &name), cx);
+                                    this.map.clear();
+                                } else {
+                                    this.confirm_delete = Some(n2.clone());
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .into_any_element()];
+                rows.push(heading(&format!("Songs ({}) — in play order", songs.len())).into_any_element());
+                let last = songs.len().saturating_sub(1);
+                for (j, &s) in songs.iter().enumerate() {
+                    let path = graph.song_paths[s].clone();
+                    let (up, down, del) = (path.clone(), path.clone(), path.clone());
+                    let (nu, nd, nx) = (name.clone(), name.clone(), name.clone());
+                    let small = |id: (&'static str, usize), label: &'static str| {
+                        div()
+                            .id(id)
+                            .w(px(18.))
+                            .text_center()
+                            .cursor_pointer()
+                            .text_color(t.text_muted)
+                            .hover(|s| s.text_color(t.accent))
+                            .child(label)
+                    };
+                    rows.push(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().w(px(22.)).text_xs().text_color(t.text_muted).child(format!("{}", j + 1)))
+                            .child(div().flex_1().overflow_hidden().child(link(100 + j, NodeId::Song(s), cx)))
+                            .child(small(("pl-up", j), if j > 0 { "↑" } else { "" }).on_click(cx.listener(
+                                move |this, _, _, cx| this.move_in_playlist(&nu, &up, -1, cx),
+                            )))
+                            .child(small(("pl-down", j), if j < last { "↓" } else { "" }).on_click(cx.listener(
+                                move |this, _, _, cx| this.move_in_playlist(&nd, &down, 1, cx),
+                            )))
+                            .child(small(("pl-del", j), "×").on_click(cx.listener(move |this, _, _, cx| {
+                                let (name, song) = (nx.clone(), del.clone());
+                                this.playlist_op(move |root| playlists::remove(root, &name, &song).map(|_| ()), cx);
+                            })))
+                            .into_any_element(),
+                    );
+                }
+                if songs.is_empty() {
+                    rows.push(
+                        div()
+                            .text_color(t.text_muted)
+                            .child("Empty. Select a song and use “Add to playlist”.")
+                            .into_any_element(),
+                    );
+                }
+                ("Playlist", rows)
             }
             n => {
                 let (kind, what) = match n {
@@ -1539,8 +1858,13 @@ impl Render for Workspace {
                 this.player.skip(10.0);
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
-                // Esc peels back one layer: palette, picker, song selection, then the group.
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| this.confirm_prompt(window, cx)))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| {
+                // Esc peels back one layer: prompt, palette, picker, song selection, then group.
+                if this.prompt.is_some() {
+                    this.close_prompt(window, cx);
+                    return;
+                }
                 if this.palette.is_some() {
                     this.palette = None;
                 } else if this.map.picker.is_some() {
@@ -1560,6 +1884,7 @@ impl Render for Workspace {
             .child(self.canvas_area(&t, window, cx))
             .child(self.preview_bar(&t, cx))
             .children(self.palette.map(|m| self.palette(m, &t)))
+            .children(self.prompt.as_ref().map(|p| self.prompt_view(p, &t)))
     }
 }
 
@@ -1580,11 +1905,13 @@ fn main() {
             KeyBinding::new("cmd-shift-p", CommandPalette, None),
             KeyBinding::new("cmd-o", OpenFolder, None),
             KeyBinding::new("escape", Dismiss, None),
+            KeyBinding::new("enter", Confirm, Some("TextInput")),
             KeyBinding::new("space", TogglePlay, Some("Workspace")),
             KeyBinding::new("left", SkipBack, Some("Workspace")),
             KeyBinding::new("right", SkipForward, Some("Workspace")),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
+        input::bind_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);

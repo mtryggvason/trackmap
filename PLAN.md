@@ -86,8 +86,14 @@ highlights its songs and dims the rest; they never appear as nodes.
 - Filters (New, later search/BPM/key) limit which songs are shown; a selection's songs always show.
 - Esc closes the picker, then clears the selection.
 
+**Playlists (done, first version)**
+- Playlists ▾ → "+ New playlist…" (adds the selected song, if any). A song's inspector has
+  "Add to playlist" with ✓ toggles and "New playlist…".
+- A playlist's inspector lists its songs in play order with ↑ ↓ to reorder and × to remove,
+  plus Rename and Delete (click twice). Only links change; music files are never touched.
+
 **Interaction (planned)**
-- Drag a song onto a playlist (drop targets appear while dragging), plus "+ New playlist".
+- Drag a song onto a playlist (drop targets appear while dragging).
 - Box-select (shift-drag) for several songs.
 - Right-click: reveal in Finder, remove from playlist.
 

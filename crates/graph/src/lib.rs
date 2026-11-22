@@ -58,15 +58,11 @@ const MAX_GAP_BINS: f32 = 2.5;
 /// map's width depends on how many tempos are present, not on the BPM range.
 pub const SLOT: f32 = 44.0;
 
-/// Tempo bin width for a zoom level: whole BPM at 1×, finer as you zoom in, coarser out.
-pub fn bin_for_zoom(zoom: f32) -> f32 {
-    let target = 1.0 / zoom.max(0.01);
-    BINS.into_iter().find(|b| *b >= target / 1.4).unwrap_or(BINS[BINS.len() - 1])
-}
+/// Tempos are grouped by whole BPM on the drawn axis; zooming only magnifies.
+pub const BPM_BIN: f32 = 1.0;
 
 /// The BPM axis as actually drawn: one [`SLOT`] per bin, so neighbouring tempos keep their true
-/// spacing while empty stretches are compressed to a short break. Built for one bin width
-/// (which follows the zoom), so zooming in splits tempos more finely.
+/// spacing while empty stretches are compressed to a short break.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Axis {
     /// Width of one bin in BPM.
@@ -308,15 +304,6 @@ mod tests {
         assert!(fine.x(131.0) - fine.x(124.3) <= MAX_GAP_BINS * fine.cell + 1e-3);
     }
 
-    #[test]
-    fn zoom_sets_the_bin() {
-        assert_eq!(bin_for_zoom(1.0), 1.0);
-        assert_eq!(bin_for_zoom(2.0), 0.5);
-        assert_eq!(bin_for_zoom(5.0), 0.2);
-        assert_eq!(bin_for_zoom(12.0), 0.1);
-        assert_eq!(bin_for_zoom(0.5), 2.0);
-        assert_eq!(bin_for_zoom(0.05), 10.0);
-    }
 
     #[test]
     fn zooming_in_picks_finer_bins() {

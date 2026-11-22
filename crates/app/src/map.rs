@@ -156,8 +156,6 @@ pub struct MapState {
     pub drawn: Vec<(usize, WorldPoint)>,
     /// Song positions for a (bin width, graph, shown songs) combination, reused until it changes.
     pub positions: Option<(f32, Rc<Graph>, u64, Rc<Vec<WorldPoint>>)>,
-    /// The same at normal zoom, which the camera frames.
-    pub base_positions: Option<(f32, Rc<Graph>, u64, Rc<Vec<WorldPoint>>)>,
     /// The layout and shown songs last drawn, and where each shown song actually was.
     last_target: Option<Rc<Vec<WorldPoint>>>,
     last_shown: Vec<usize>,
@@ -188,7 +186,6 @@ impl Default for MapState {
             bounds: Rc::new(Cell::new(Bounds::default())),
             drawn: Vec::new(),
             positions: None,
-            base_positions: None,
             last_target: None,
             last_shown: Vec::new(),
             current: HashMap::new(),

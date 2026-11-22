@@ -948,16 +948,14 @@ impl Workspace {
                 }
             }
         };
-        // The camera frames the songs as laid out at normal zoom; pinching then magnifies, and
-        // the tempo bins get finer (1 → 0.5 → 0.2 → 0.1 BPM) so close tempos separate.
-        let base_bin = trackmap_graph::bin_for_zoom(1.0);
-        let bin = trackmap_graph::bin_for_zoom(self.map.zoom);
-        let base = place(base_bin, &mut self.map.base_positions);
+        // Whole-BPM groups at every zoom level: zooming only magnifies, so nothing moves under
+        // your fingers. The camera frames the shown songs.
+        let bin = trackmap_graph::BPM_BIN;
         let positions = place(bin, &mut self.map.positions);
         let axis = graph.axis_for(&shown, bin);
         let row = layout.row_height();
         let slot = trackmap_graph::SLOT;
-        if let Some(target) = map::Fit::around(shown.iter().map(|&s| base[s]), slot * 0.7, row * 0.6) {
+        if let Some(target) = map::Fit::around(shown.iter().map(|&s| positions[s]), slot * 0.7, row * 0.6) {
             animating |= self.map.step_fit(target, now);
         }
         // Covers fill the space each song has on screen (a slot wide, a row high).

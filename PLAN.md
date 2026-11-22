@@ -66,8 +66,8 @@ highlights its songs and dims the rest; they never appear as nodes.
 - x = BPM. Each occupied tempo bin gets one fixed-width slot, so neighbouring tempos keep their
   true spacing while empty stretches are compressed to a short break (marked ⋯ on the axis).
   Labels show the tempos that have songs.
-- Zoom sets the precision: whole BPM at 1×, 0.5 at 2×, 0.2 at 5×, 0.1 at 10×; coarser when
-  zoomed out. Songs glide as bins split.
+- Tempos are grouped by whole BPM at every zoom level; zooming only magnifies (covers and
+  gaps grow), so nothing moves under your fingers. Pinch has momentum and rubber-band limits.
 - y = key, in Camelot order with A/B pairs adjacent (1A, 1B, 2A, …), unknown keys at the bottom.
   Subsets only show the keys they contain.
 - The camera always frames the shown songs (at 1× zoom), easing when the set changes; covers

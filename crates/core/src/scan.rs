@@ -1,18 +1,19 @@
 //! Walks a library root and reads tags from every playable file.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lofty::prelude::*;
-use walkdir::{DirEntry, WalkDir};
+use walkdir::WalkDir;
 
-use crate::{is_supported_audio, Camelot, Track, PLAYLISTS_DIR};
+use crate::{cache, is_library_path, is_supported_audio, Camelot, Track};
 
 #[derive(Debug, Clone, Default)]
 pub struct Library {
     pub root: PathBuf,
+    /// Sorted by path.
     pub tracks: Vec<Track>,
 }
 
@@ -24,47 +25,92 @@ impl Library {
     pub fn label_count(&self) -> usize {
         distinct(self.tracks.iter().filter_map(|t| t.label.as_deref()))
     }
+
+    pub(crate) fn sort(&mut self) {
+        self.tracks.sort_by(|a, b| a.path.cmp(&b.path));
+    }
 }
 
 fn distinct<'a>(it: impl Iterator<Item = &'a str>) -> usize {
     it.collect::<HashSet<_>>().len()
 }
 
-/// Scans `root` recursively. Skips hidden entries (such as `.napworks/`) and the top-level
-/// `Playlists/` folder, whose entries are links to tracks that are already in the library.
-/// Files with unreadable tags are still included, using the file name as the title.
-pub fn scan(root: &Path) -> io::Result<Library> {
-    let root = root.canonicalize()?;
-    let playlists = root.join(PLAYLISTS_DIR);
-    let mut tracks = Vec::new();
-
-    let walker = WalkDir::new(&root)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || (!is_hidden(e) && e.path() != playlists));
-
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue, // unreadable directory: skip, keep scanning the rest
-        };
-        if entry.file_type().is_file() && is_supported_audio(entry.path()) {
-            tracks.push(read_track(entry.path()));
-        }
-    }
-
-    Ok(Library { root, tracks })
+/// Result of opening a library.
+#[derive(Debug, Clone)]
+pub struct ScanReport {
+    pub library: Library,
+    /// Tracks that were not in the cache, i.e. added while the app was closed.
+    /// Empty the first time a folder is opened, since there is nothing to compare against.
+    pub new: Vec<PathBuf>,
 }
 
-fn is_hidden(e: &DirEntry) -> bool {
-    e.file_name().to_str().is_some_and(|s| s.starts_with('.'))
+/// Opens a library: loads the cache, rescans (re-reading only changed files), saves the cache.
+pub fn open(root: &Path) -> io::Result<ScanReport> {
+    let root = root.canonicalize()?;
+    let cached = cache::load(&root);
+    let report = scan_with(&root, cached.as_ref(), now())?;
+    // A read-only library still opens; it just won't remember anything.
+    let _ = cache::save(&report.library);
+    Ok(report)
+}
+
+/// Scans `root` from scratch, without a cache.
+pub fn scan(root: &Path) -> io::Result<Library> {
+    Ok(scan_with(&root.canonicalize()?, None, now())?.library)
+}
+
+pub(crate) fn scan_with(
+    root: &Path,
+    cached: Option<&HashMap<PathBuf, Track>>,
+    now: u64,
+) -> io::Result<ScanReport> {
+    if !root.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "not a folder"));
+    }
+    let mut tracks = Vec::new();
+    let mut new = Vec::new();
+
+    for path in audio_files(root, root) {
+        let prev = cached.and_then(|c| c.get(&path));
+        let (size, modified) = file_stamp(&path);
+        let track = match prev {
+            Some(t) if t.size == size && t.modified == modified => t.clone(),
+            Some(t) => Track { added_at: t.added_at, ..read_track(&path) },
+            None if cached.is_some() => {
+                new.push(path.clone());
+                Track { added_at: Some(now), ..read_track(&path) }
+            }
+            // First time this folder is opened: fall back to the file's creation date.
+            None => read_track(&path),
+        };
+        tracks.push(track);
+    }
+
+    let mut library = Library { root: root.to_path_buf(), tracks };
+    library.sort();
+    Ok(ScanReport { library, new })
+}
+
+/// All playable files under `dir` that belong to the library at `root`.
+pub(crate) fn audio_files(root: &Path, dir: &Path) -> Vec<PathBuf> {
+    WalkDir::new(dir)
+        .into_iter()
+        .filter_entry(|e| e.path() == root || is_library_path(root, e.path()))
+        // Unreadable directories are skipped; the rest is still scanned.
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file() && is_supported_audio(e.path()))
+        .map(|e| e.into_path())
+        .collect()
 }
 
 /// Reads tags from one file. Never fails: missing tags just leave fields empty.
 pub fn read_track(path: &Path) -> Track {
+    let (size, modified) = file_stamp(path);
     let mut track = Track {
         path: path.to_path_buf(),
-        added_at: added_at(path),
+        added_at: created_at(path),
+        size,
+        modified,
         ..Default::default()
     };
 
@@ -98,15 +144,30 @@ fn first_string(tag: &lofty::tag::Tag, keys: &[ItemKey]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn added_at(path: &Path) -> Option<u64> {
-    let meta = std::fs::metadata(path).ok()?;
-    let t = meta.created().or_else(|_| meta.modified()).ok()?;
+pub(crate) fn now() -> u64 {
+    unix(SystemTime::now()).unwrap_or(0)
+}
+
+fn unix(t: SystemTime) -> Option<u64> {
     t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
 }
 
+fn file_stamp(path: &Path) -> (u64, Option<u64>) {
+    match std::fs::metadata(path) {
+        Ok(m) => (m.len(), m.modified().ok().and_then(unix)),
+        Err(_) => (0, None),
+    }
+}
+
+fn created_at(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    meta.created().or_else(|_| meta.modified()).ok().and_then(unix)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::PLAYLISTS_DIR;
     use lofty::config::WriteOptions;
     use lofty::tag::{Tag, TagType};
     use std::fs;
@@ -131,10 +192,10 @@ mod tests {
         b
     }
 
-    fn write_tagged_wav(path: &Path) {
+    pub(crate) fn write_tagged_wav(path: &Path, title: &str) {
         fs::write(path, wav_bytes()).unwrap();
         let mut tag = Tag::new(TagType::Id3v2);
-        tag.set_title("Night Drive".into());
+        tag.set_title(title.into());
         tag.set_artist("Some Artist".into());
         tag.set_album("Some EP".into());
         tag.insert_text(ItemKey::Label, "Good Label".into());
@@ -143,11 +204,18 @@ mod tests {
         tag.save_to_path(path, WriteOptions::default()).unwrap();
     }
 
+    pub(crate) fn rel(lib: &Library) -> Vec<String> {
+        lib.tracks
+            .iter()
+            .map(|t| t.path.strip_prefix(&lib.root).unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn reads_tags() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("track.wav");
-        write_tagged_wav(&p);
+        write_tagged_wav(&p, "Night Drive");
 
         let t = read_track(&p);
         assert_eq!(t.title.as_deref(), Some("Night Drive"));
@@ -157,6 +225,7 @@ mod tests {
         assert_eq!(t.bpm, Some(124.0));
         assert_eq!(t.key, Some("8A".parse().unwrap()));
         assert!(t.added_at.is_some());
+        assert!(t.size > 0 && t.modified.is_some());
     }
 
     #[test]
@@ -178,7 +247,7 @@ mod tests {
         fs::create_dir_all(root.join(PLAYLISTS_DIR).join("Warmup")).unwrap();
         fs::create_dir_all(root.join(".napworks")).unwrap();
 
-        write_tagged_wav(&root.join("House/Deep/a.wav"));
+        write_tagged_wav(&root.join("House/Deep/a.wav"), "A");
         fs::write(root.join("House/b.mp3"), b"x").unwrap();
         fs::write(root.join("House/cover.jpg"), b"x").unwrap();
         fs::write(root.join("House/c.m4a"), b"x").unwrap();
@@ -187,13 +256,7 @@ mod tests {
         fs::write(root.join("House/.hidden.mp3"), b"x").unwrap();
 
         let lib = scan(root).unwrap();
-        let mut names: Vec<_> = lib
-            .tracks
-            .iter()
-            .map(|t| t.path.strip_prefix(&lib.root).unwrap().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        assert_eq!(names, ["House/Deep/a.wav", "House/b.mp3"]);
+        assert_eq!(rel(&lib), ["House/Deep/a.wav", "House/b.mp3"]);
         assert_eq!(lib.artist_count(), 1);
         assert_eq!(lib.label_count(), 1);
     }
@@ -201,5 +264,48 @@ mod tests {
     #[test]
     fn scan_missing_root_is_an_error() {
         assert!(scan(Path::new("/definitely/not/here")).is_err());
+    }
+
+    #[test]
+    fn open_reports_files_added_while_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_tagged_wav(&root.join("a.wav"), "A");
+
+        // First open: nothing to compare against, so nothing is "new".
+        let first = open(root).unwrap();
+        assert!(first.new.is_empty());
+        assert_eq!(first.library.tracks.len(), 1);
+
+        // Add a file while "closed", then reopen.
+        write_tagged_wav(&root.join("b.wav"), "B");
+        let second = open(root).unwrap();
+        assert_eq!(rel(&second.library), ["a.wav", "b.wav"]);
+        assert_eq!(second.new, [second.library.root.join("b.wav")]);
+
+        // Third open: b is no longer new, and a keeps its original added_at.
+        let third = open(root).unwrap();
+        assert!(third.new.is_empty());
+        assert_eq!(third.library.tracks[0].added_at, first.library.tracks[0].added_at);
+    }
+
+    #[test]
+    fn unchanged_files_come_from_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write_tagged_wav(&root.join("a.wav"), "Real Title");
+
+        let mut cached = HashMap::new();
+        let mut t = read_track(&root.join("a.wav"));
+        t.title = Some("From Cache".into());
+        cached.insert(t.path.clone(), t.clone());
+        let lib = scan_with(&root, Some(&cached), 0).unwrap().library;
+        assert_eq!(lib.tracks[0].title.as_deref(), Some("From Cache"));
+
+        // A changed size forces a re-read.
+        t.size += 1;
+        cached.insert(t.path.clone(), t);
+        let lib = scan_with(&root, Some(&cached), 0).unwrap().library;
+        assert_eq!(lib.tracks[0].title.as_deref(), Some("Real Title"));
     }
 }

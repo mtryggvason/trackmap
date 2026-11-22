@@ -3,8 +3,10 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// A Camelot wheel position. `number` is 1..=12; `minor` is the A ring, otherwise B.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Camelot {
     pub number: u8,
     pub minor: bool,

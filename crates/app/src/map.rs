@@ -2,7 +2,8 @@
 //! artist, label or playlist highlights its songs.
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,6 +13,41 @@ use gpui::{
 };
 use trackmap_core::Camelot;
 use trackmap_graph::{Columns, Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint, KEY_ROWS};
+
+/// How long transitions take.
+const TRANSITION: Duration = Duration::from_millis(320);
+
+/// Ease-out cubic: fast start, gentle landing.
+fn ease(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+fn lerp(a: WorldPoint, b: WorldPoint, t: f32) -> WorldPoint {
+    WorldPoint { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }
+}
+
+/// Songs moving between layouts: where each started, and songs fading out where they were.
+struct SongMotion {
+    start: Instant,
+    from: HashMap<usize, WorldPoint>,
+    leaving: Vec<(usize, WorldPoint)>,
+}
+
+/// The camera easing from one pan/zoom to another.
+struct ViewMotion {
+    start: Instant,
+    from: (Point<Pixels>, f32),
+    to: (Point<Pixels>, f32),
+}
+
+/// What to draw this frame: every song's current position, how visible each shown song is
+/// (fading in), and songs that are fading out.
+pub struct Animated {
+    pub positions: Vec<WorldPoint>,
+    pub alpha: HashMap<usize, f32>,
+    pub leaving: Vec<(usize, WorldPoint, f32)>,
+    pub running: bool,
+}
 
 /// Which list the Artists / Labels / Playlists chip has open.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,6 +92,12 @@ pub struct MapState {
     pub drawn: Vec<(usize, WorldPoint)>,
     /// Song positions for a (bin width, graph, shown songs) combination, reused until it changes.
     pub positions: Option<(f32, Rc<Graph>, u64, Rc<Vec<WorldPoint>>)>,
+    /// The layout and shown songs last drawn, and where each shown song actually was.
+    last_target: Option<Rc<Vec<WorldPoint>>>,
+    last_shown: Vec<usize>,
+    current: HashMap<usize, WorldPoint>,
+    songs_motion: Option<SongMotion>,
+    view_motion: Option<ViewMotion>,
 }
 
 impl Default for MapState {
@@ -73,6 +115,11 @@ impl Default for MapState {
             bounds: Rc::new(Cell::new(Bounds::default())),
             drawn: Vec::new(),
             positions: None,
+            last_target: None,
+            last_shown: Vec::new(),
+            current: HashMap::new(),
+            songs_motion: None,
+            view_motion: None,
         }
     }
 }
@@ -132,8 +179,78 @@ impl MapState {
             .map(|(n, _)| n)
     }
 
+    /// Eases the camera to a new pan/zoom instead of jumping there.
+    fn move_view_to(&mut self, pan: Point<Pixels>, zoom: f32) {
+        self.view_motion = Some(ViewMotion { start: Instant::now(), from: (self.pan, self.zoom), to: (pan, zoom) });
+    }
+
+    /// Stops any camera transition (the user is steering).
+    pub fn stop_view_motion(&mut self) {
+        self.view_motion = None;
+    }
+
+    /// Advances the camera transition. Returns whether it's still running.
+    pub fn step_view(&mut self, now: Instant) -> bool {
+        let Some(m) = &self.view_motion else { return false };
+        let t = (now - m.start).as_secs_f32() / TRANSITION.as_secs_f32();
+        let e = ease(t);
+        let (fp, fz) = m.from;
+        let (tp, tz) = m.to;
+        self.pan = point(fp.x + (tp.x - fp.x) * e, fp.y + (tp.y - fp.y) * e);
+        // Interpolate zoom geometrically so it feels even in and out.
+        self.zoom = fz * (tz / fz).powf(e);
+        if t >= 1.0 {
+            self.view_motion = None;
+            return false;
+        }
+        true
+    }
+
+    /// Positions to draw for `target` (the layout's positions) and `shown` songs, starting a
+    /// transition whenever either changes. Songs glide from where they were; new ones fade in
+    /// and songs no longer shown fade out in place.
+    pub fn animate(&mut self, target: &Rc<Vec<WorldPoint>>, shown: &[usize], now: Instant) -> Animated {
+        let changed = !self.last_target.as_ref().is_some_and(|t| Rc::ptr_eq(t, target))
+            || self.last_shown != shown;
+        if changed {
+            if !self.current.is_empty() {
+                let keep: HashSet<usize> = shown.iter().copied().collect();
+                let leaving = self.current.iter().filter(|(s, _)| !keep.contains(s)).map(|(s, p)| (*s, *p)).collect();
+                self.songs_motion = Some(SongMotion { start: now, from: self.current.clone(), leaving });
+            }
+            self.last_target = Some(target.clone());
+            self.last_shown = shown.to_vec();
+        }
+
+        let mut positions = target.to_vec();
+        let mut alpha = HashMap::new();
+        let mut leaving = Vec::new();
+        let mut running = false;
+        if let Some(m) = &self.songs_motion {
+            let t = (now - m.start).as_secs_f32() / TRANSITION.as_secs_f32();
+            let e = ease(t);
+            if t < 1.0 {
+                running = true;
+                for &s in shown {
+                    match m.from.get(&s) {
+                        Some(&from) => positions[s] = lerp(from, target[s], e),
+                        None => {
+                            alpha.insert(s, e);
+                        }
+                    }
+                }
+                leaving = m.leaving.iter().map(|&(s, p)| (s, p, 1.0 - e)).collect();
+            } else {
+                self.songs_motion = None;
+            }
+        }
+        self.current = shown.iter().map(|&s| (s, positions[s])).collect();
+        Animated { positions, alpha, leaving, running }
+    }
+
     /// Zooms by `factor`, keeping the world point under `anchor` fixed on screen.
     pub fn zoom_at(&mut self, anchor: Point<Pixels>, factor: f32) {
+        self.view_motion = None;
         let before = self.transform();
         let world = before.to_world(anchor);
         self.zoom = (self.zoom * factor).clamp(0.3, 40.0);
@@ -150,8 +267,7 @@ impl MapState {
             if self.saved_view.is_none() {
                 self.saved_view = Some((self.pan, self.zoom));
             }
-            self.pan = point(px(0.), px(0.));
-            self.zoom = 1.0;
+            self.move_view_to(point(px(0.), px(0.)), 1.0);
             self.scope = Some(key.clone());
         }
         self.selected = Some(key);
@@ -172,8 +288,7 @@ impl MapState {
         self.picker = None;
         if self.scope.take().is_some() {
             if let Some((pan, zoom)) = self.saved_view.take() {
-                self.pan = pan;
-                self.zoom = zoom;
+                self.move_view_to(pan, zoom);
             }
         }
     }
@@ -185,6 +300,8 @@ pub fn key_color(k: Camelot) -> Hsla {
 
 struct DrawSong {
     pos: WorldPoint,
+    /// 1 when fully shown; less while fading in or out.
+    alpha: f32,
     /// Lower is more important when titles compete for space.
     label_priority: u8,
     art: Option<Arc<RenderImage>>,
@@ -219,7 +336,7 @@ impl Frame {
         layout: MapLayout,
         columns: Option<Columns>,
         has_no_bpm: bool,
-        positions: &[WorldPoint],
+        anim: &Animated,
         keys: &[Option<Camelot>],
         arts: &[Option<Arc<RenderImage>>],
         shown: &[usize],
@@ -245,8 +362,22 @@ impl Frame {
         // very large views skip them to keep painting fast.
         let label_all = order.len() <= 1500;
 
+        let positions = &anim.positions;
         let mut drawn = Vec::with_capacity(order.len());
-        let songs = order
+        // Songs fading out are drawn first, underneath, and can't be clicked.
+        let fading = anim.leaving.iter().map(|&(s, pos, a)| DrawSong {
+            pos,
+            alpha: a,
+            label_priority: 4,
+            art: arts.get(s).cloned().flatten(),
+            dimmed: false,
+            fill: hsla(0., 0., 0.55, 1.),
+            ring: keys[s].map(key_color).unwrap_or(muted),
+            big: false,
+            label: None,
+            label_color: muted,
+        });
+        let songs = fading.collect::<Vec<_>>().into_iter().chain(order
             .iter()
             .map(|&s| {
                 let pos = positions[s];
@@ -262,6 +393,7 @@ impl Frame {
                 let labelled = is_hover || in_focus || label_all;
                 DrawSong {
                     pos,
+                    alpha: anim.alpha.get(&s).copied().unwrap_or(1.0),
                     label_priority: if is_hover {
                         0
                     } else if in_focus {
@@ -285,11 +417,11 @@ impl Frame {
                         muted
                     },
                 }
-            })
+            }))
             .collect();
 
         let route = match route_of {
-            Some(p @ NodeId::Playlist(_)) => graph.songs_of(p).iter().map(|&s| positions[s]).collect(),
+            Some(p @ NodeId::Playlist(_)) => graph.songs_of(p).iter().map(|&s| anim.positions[s]).collect(),
             _ => Vec::new(),
         };
 
@@ -327,19 +459,21 @@ impl Frame {
                 let b = Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d));
                 let radius = px(3.);
                 let _ = window.paint_image(b, b, radius.into(), img.clone(), 0, s.dimmed);
-                if s.dimmed {
-                    window.paint_quad(quad(b, radius, bg.opacity(0.7), px(0.), bg, BorderStyle::Solid));
+                // Dimming and fading are a veil of background colour over the cover.
+                let veil = 1.0 - (1.0 - if s.dimmed { 0.7 } else { 0.0 }) * s.alpha;
+                if veil > 0.0 {
+                    window.paint_quad(quad(b, radius, bg.opacity(veil), px(0.), bg, BorderStyle::Solid));
                 }
-                window.paint_quad(quad(b, radius, transparent_black(), px(1.5), s.ring, BorderStyle::Solid));
+                window.paint_quad(quad(b, radius, transparent_black(), px(1.5), s.ring.opacity(s.alpha), BorderStyle::Solid));
                 d
             } else {
                 let d = px(if s.big { 13. } else { 9. });
                 window.paint_quad(quad(
                     Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d)),
                     d / 2.,
-                    s.fill,
+                    s.fill.opacity(s.alpha),
                     px(1.5),
-                    s.ring,
+                    s.ring.opacity(s.alpha),
                     BorderStyle::Solid,
                 ));
                 d
@@ -362,6 +496,9 @@ impl Frame {
         let mut candidates = Vec::new();
         for (i, s) in self.songs.iter().enumerate() {
             let Some(label) = &s.label else { continue };
+            if s.alpha < 0.6 {
+                continue; // no titles on songs still fading in
+            }
             let nb = node_boxes[i];
             if !nb.overlaps(&view) {
                 continue;
@@ -589,7 +726,11 @@ mod tests {
         let artist = NodeKey::Artist("Ann".into());
         let song = NodeKey::Song("/a".into());
 
+        let settle = |s: &mut MapState| {
+            s.step_view(Instant::now() + TRANSITION * 2);
+        };
         s.select(artist.clone());
+        settle(&mut s);
         assert_eq!((s.scope.as_ref(), s.zoom), (Some(&artist), 1.0), "fits the group");
         s.select(song.clone());
         assert_eq!(s.scope.as_ref(), Some(&artist), "picking a song stays in the group");
@@ -598,6 +739,7 @@ mod tests {
         s.back();
         assert_eq!(s.selected.as_ref(), Some(&artist), "first Esc deselects the song");
         s.back();
+        settle(&mut s);
         assert_eq!((s.scope.as_ref(), s.selected.as_ref()), (None, None));
         assert_eq!((s.pan, s.zoom), (point(px(40.), px(-10.)), 3.0), "view restored");
 
@@ -606,7 +748,46 @@ mod tests {
         s.zoom = 2.0;
         s.select(NodeKey::Label("Lab".into()));
         s.clear();
+        settle(&mut s);
         assert_eq!(s.zoom, 3.0);
+    }
+
+    #[test]
+    fn songs_glide_and_fade_between_layouts() {
+        let mut s = MapState::default();
+        let t0 = Instant::now();
+        let a = Rc::new(vec![WorldPoint { x: 0., y: 0. }, WorldPoint { x: 100., y: 0. }, WorldPoint { x: 0., y: 50. }]);
+        // First frame: nothing to animate from.
+        let f = s.animate(&a, &[0, 1], t0);
+        assert!(!f.running && f.positions[1].x == 100.);
+
+        // New layout: song 1 moves, song 0 disappears, song 2 appears.
+        let b = Rc::new(vec![WorldPoint { x: 0., y: 0. }, WorldPoint { x: 200., y: 0. }, WorldPoint { x: 0., y: 50. }]);
+        let t1 = t0 + Duration::from_millis(500);
+        let first = s.animate(&b, &[1, 2], t1);
+        assert_eq!(first.positions[1].x, 100., "starts where it was");
+        let mid = s.animate(&b, &[1, 2], t1 + TRANSITION / 2);
+        assert!(mid.running);
+        assert!(mid.positions[1].x > 100. && mid.positions[1].x < 200., "song 1 is on its way");
+        assert!(mid.alpha[&2] > 0. && mid.alpha[&2] < 1., "song 2 fades in");
+        assert_eq!(mid.leaving.len(), 1);
+        assert_eq!(mid.leaving[0].0, 0, "song 0 fades out");
+
+        let end = s.animate(&b, &[1, 2], t1 + TRANSITION * 2);
+        assert!(!end.running && end.positions[1].x == 200. && end.leaving.is_empty() && end.alpha.is_empty());
+    }
+
+    #[test]
+    fn camera_eases_into_a_group_and_back() {
+        let mut s = MapState::default();
+        s.zoom = 4.0;
+        s.select(NodeKey::Artist("Ann".into()));
+        assert_eq!(s.zoom, 4.0, "doesn't jump");
+        let start = s.view_motion.as_ref().unwrap().start;
+        assert!(s.step_view(start + TRANSITION / 2));
+        assert!(s.zoom < 4.0 && s.zoom > 1.0);
+        assert!(!s.step_view(start + TRANSITION * 2));
+        assert_eq!(s.zoom, 1.0);
     }
 
     #[test]

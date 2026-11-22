@@ -778,7 +778,7 @@ impl Workspace {
         out
     }
 
-    fn canvas_area(&mut self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn canvas_area(&mut self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let centered = |text: SharedString| {
             div()
                 .flex_1()
@@ -803,7 +803,7 @@ impl Workspace {
                     .flex_1()
                     .flex()
                     .bg(t.bg_app)
-                    .child(self.map_view(t, cx))
+                    .child(self.map_view(t, window, cx))
                     .children(self.inspector(t, cx))
                     .into_any_element();
             }
@@ -903,7 +903,9 @@ impl Workspace {
             )
     }
 
-    fn map_view(&mut self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn map_view(&mut self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let now = std::time::Instant::now();
+        let mut animating = self.map.step_view(now);
         let (Some(graph), LibraryState::Loaded(lib)) = (self.graph.clone(), &self.library) else {
             return div().into_any_element();
         };
@@ -958,13 +960,18 @@ impl Workspace {
         // Highlighting only applies to a song picked inside the view, not to the group itself.
         let highlight = selected.filter(|_| self.map.selected != self.map.scope);
         let route_of = selected.filter(|n| matches!(n, NodeId::Playlist(_))).or(scope);
+        let anim = self.map.animate(&positions, &shown, now);
+        animating |= anim.running;
+        if animating {
+            window.request_animation_frame();
+        }
         let has_no_bpm = shown.iter().any(|&s| graph.tempo(s).is_none());
         let (frame, drawn) = Frame::build(
             &graph,
             layout,
             columns,
             has_no_bpm,
-            &positions,
+            &anim,
             &keys,
             &arts,
             &shown,
@@ -1008,6 +1015,7 @@ impl Workspace {
                         let delta = e.position - from;
                         if this.map.dragged || f32::from(delta.x.abs() + delta.y.abs()) > 3.0 {
                             this.map.dragged = true;
+                            this.map.stop_view_motion();
                             this.map.pan = this.map.pan + delta;
                             this.map.drag_from = Some(e.position);
                             cx.notify();
@@ -1058,6 +1066,7 @@ impl Workspace {
                     let factor = (1.0 - f32::from(d.y) * 0.005).clamp(0.5, 2.0);
                     this.map.zoom_at(e.position, factor);
                 } else {
+                    this.map.stop_view_motion();
                     this.map.pan = this.map.pan + d;
                 }
                 cx.notify();
@@ -1295,7 +1304,7 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *Theme::get(cx);
         self.visible = match &self.library {
             LibraryState::Loaded(lib) => (0..lib.tracks.len())
@@ -1333,7 +1342,7 @@ impl Render for Workspace {
             .bg(t.bg_app)
             .text_sm()
             .child(self.top_bar(&t, cx))
-            .child(self.canvas_area(&t, cx))
+            .child(self.canvas_area(&t, window, cx))
             .child(self.preview_bar(&t))
             .children(self.palette.map(|m| self.palette(m, &t)))
     }

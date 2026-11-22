@@ -5810,6 +5810,7 @@ dependencies = [
  "futures",
  "gpui",
  "trackmap-core",
+ "trackmap-graph",
 ]
 
 [[package]]

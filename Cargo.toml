@@ -9,5 +9,6 @@ license = "MIT"
 
 [workspace.dependencies]
 trackmap-core = { path = "crates/core" }
+trackmap-graph = { path = "crates/graph" }
 # runtime_shaders: compile Metal shaders at startup so a full Xcode install is not required.
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }

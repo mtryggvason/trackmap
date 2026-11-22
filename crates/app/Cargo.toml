@@ -9,3 +9,4 @@ dirs = "7.0.0"
 futures = "0.3.34"
 gpui.workspace = true
 trackmap-core.workspace = true
+trackmap-graph.workspace = true

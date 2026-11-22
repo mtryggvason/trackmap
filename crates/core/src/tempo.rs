@@ -5,17 +5,13 @@
 //! 3. Autocorrelate that curve and score each candidate tempo by how well beats repeat at
 //!    1–4 beat intervals, with a mild preference for 100–140 BPM to settle half/double tempo.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
-use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
-use symphonia::core::meta::MetadataOptions;
+use symphonia::core::formats::TrackType;
 
 use crate::Track;
 
@@ -51,44 +47,9 @@ pub fn detect_file(path: &Path) -> Option<f32> {
     detect(&samples[start..], rate)
 }
 
-/// Size of a leading ID3v2 tag (header and footer included), if the file starts with one.
-fn id3v2_len(path: &Path) -> Option<u64> {
-    use std::io::Read;
-    let mut h = [0u8; 10];
-    File::open(path).ok()?.read_exact(&mut h).ok()?;
-    if &h[..3] != b"ID3" {
-        return None;
-    }
-    let size = h[6..10].iter().fold(0u64, |acc, b| (acc << 7) | (*b & 0x7f) as u64);
-    let footer = if h[5] & 0x10 != 0 { 10 } else { 0 };
-    Some(10 + size + footer)
-}
-
 /// Decodes up to `max_secs` of audio as mono f32.
 pub fn decode_mono(path: &Path, max_secs: f32) -> Option<(Vec<f32>, u32)> {
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        hint.with_extension(ext);
-    }
-    fn probe<'a>(hint: &Hint, mss: MediaSourceStream<'a>) -> Option<Box<dyn FormatReader + 'a>> {
-        symphonia::default::get_probe()
-            .probe(hint, mss, FormatOptions::default(), MetadataOptions::default())
-            .ok()
-    }
-    let file = File::open(path).ok()?;
-    let mut format = match probe(&hint, MediaSourceStream::new(Box::new(file), Default::default())) {
-        Some(f) => f,
-        None => {
-            // The decoder gives up on MP3s with very large ID3 tags (big embedded artwork)
-            // before reaching the audio. Skip the tag ourselves and try again.
-            use std::io::{Seek, SeekFrom};
-            let skip = id3v2_len(path)?;
-            let mut file = File::open(path).ok()?;
-            file.seek(SeekFrom::Start(skip)).ok()?;
-            let source = ReadOnlySource::new(file);
-            probe(&hint, MediaSourceStream::new(Box::new(source), Default::default()))?
-        }
-    };
+    let (mut format, _) = crate::audio::open_format(path)?;
     let track = format.default_track(TrackType::Audio)?;
     let track_id = track.id;
     let params = track.codec_params.as_ref()?.audio()?.clone();

@@ -1,4 +1,5 @@
 mod map;
+mod player;
 mod theme;
 
 use std::collections::{HashMap, HashSet};
@@ -11,7 +12,7 @@ use std::rc::Rc;
 use futures::StreamExt;
 
 use gpui::{
-    actions, canvas, div, point, prelude::*, px, size, uniform_list, AnyElement, App,
+    actions, canvas, div, relative, point, prelude::*, px, size, uniform_list, AnyElement, App,
     Bounds, Context, FocusHandle, KeyBinding, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, PinchEvent, RenderImage, ScrollEvent,
     SharedString,
@@ -26,7 +27,7 @@ use trackmap_core::{
 };
 use trackmap_graph::{Graph, NodeId};
 
-actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
+actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit, TogglePlay, SkipBack, SkipForward]);
 
 enum LibraryState {
     Empty,
@@ -71,6 +72,11 @@ struct Workspace {
     writing_tags: bool,
     /// Result of the last tag write, shown on the map.
     notice: Option<SharedString>,
+    player: player::Player,
+    /// Whether a timer is refreshing the preview bar while audio plays.
+    ticking: bool,
+    /// Preview bar's progress track, for turning clicks into seek positions.
+    progress_bounds: Rc<std::cell::Cell<Bounds<gpui::Pixels>>>,
 }
 
 /// What a "Process …" button analyses.
@@ -165,7 +171,63 @@ impl Workspace {
             analysis: None,
             writing_tags: false,
             notice: None,
+            player: player::Player::default(),
+            ticking: false,
+            progress_bounds: Rc::new(std::cell::Cell::new(Bounds::default())),
         }
+    }
+
+    /// The song picked on the map, if any.
+    fn selected_song(&self) -> Option<PathBuf> {
+        match &self.map.selected {
+            Some(trackmap_graph::NodeKey::Song(p)) => Some(p.clone()),
+            _ => None,
+        }
+    }
+
+    /// Space: plays the selected song, or pauses/resumes what's playing.
+    fn toggle_play(&mut self, cx: &mut Context<Self>) {
+        let selected = self.selected_song();
+        match (&selected, &self.player.track) {
+            (Some(s), current) if current.as_ref() != Some(s) => self.player.play(s),
+            (_, Some(current)) if self.player.finished() => {
+                let current = current.clone();
+                self.player.play(&current);
+            }
+            (_, Some(_)) => self.player.toggle(),
+            _ => {}
+        }
+        self.start_ticking(cx);
+        cx.notify();
+    }
+
+    fn play_song(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.player.play(path);
+        self.start_ticking(cx);
+        cx.notify();
+    }
+
+    /// Refreshes the preview bar (time, progress) a few times a second while audio plays.
+    fn start_ticking(&mut self, cx: &mut Context<Self>) {
+        if self.ticking || !self.player.is_playing() {
+            return;
+        }
+        self.ticking = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(std::time::Duration::from_millis(250)).await;
+            let keep = this.update(cx, |ws, cx| {
+                cx.notify();
+                if !ws.player.is_playing() {
+                    ws.ticking = false;
+                    return false;
+                }
+                true
+            });
+            if !matches!(keep, Ok(true)) {
+                break;
+            }
+        })
+        .detach();
     }
 
     /// Writes every detected BPM and key into its file's tags so the Pocket can sort by them.
@@ -975,6 +1037,15 @@ impl Workspace {
             window.request_animation_frame();
         }
         let has_no_bpm = shown.iter().any(|&s| graph.tempo(s).is_none());
+        let playing = self
+            .player
+            .track
+            .as_ref()
+            .and_then(|p| graph.find(&trackmap_graph::NodeKey::Song(p.clone())))
+            .and_then(|n| match n {
+                NodeId::Song(i) => Some(i),
+                _ => None,
+            });
         let (frame, drawn) = Frame::build(
             &graph,
             layout,
@@ -986,6 +1057,7 @@ impl Workspace {
             &shown,
             highlight,
             route_of,
+            playing,
             self.map.hovered,
             &self.map,
             t,
@@ -1208,6 +1280,31 @@ impl Workspace {
                         }
                     ))
                     .into_any_element()];
+                let path = tr.path.clone();
+                let playing_this = self.player.track.as_ref() == Some(&tr.path) && self.player.is_playing();
+                rows.push(
+                    div()
+                        .id("inspector-play")
+                        .mt_2()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(t.accent)
+                        .hover(|s| s.bg(t.accent_hover))
+                        .text_color(t.bg_app)
+                        .child(if playing_this { "❚❚  Pause" } else { "▶  Play" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.player.track.as_ref() == Some(&path) && !this.player.finished() {
+                                this.player.toggle();
+                                this.start_ticking(cx);
+                                cx.notify();
+                            } else {
+                                this.play_song(&path, cx);
+                            }
+                        }))
+                        .into_any_element(),
+                );
                 if let Some(a) = graph.artist_of(i) {
                     rows.push(heading("Artist").into_any_element());
                     rows.push(link(0, NodeId::Artist(a), cx).into_any_element());
@@ -1269,7 +1366,27 @@ impl Workspace {
         )
     }
 
-    fn preview_bar(&self, t: &Theme) -> impl IntoElement {
+    /// Play/pause, what's playing, time, and a progress bar you can click to seek.
+    fn preview_bar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *t;
+        let p = &self.player;
+        let info = p.track.as_ref().and_then(|path| match &self.library {
+            LibraryState::Loaded(lib) => lib.tracks.iter().find(|tr| &tr.path == path),
+            _ => None,
+        });
+        let (title, artist) = match info {
+            Some(tr) => (tr.title.clone().unwrap_or_default(), tr.artist.clone().unwrap_or_default()),
+            None if self.selected_song().is_some() => ("Press Space to play the selected song".into(), String::new()),
+            None => ("Nothing playing".into(), String::new()),
+        };
+        let pos = p.position();
+        let frac = p.duration.map_or(0.0, |d| (pos.as_secs_f32() / d.as_secs_f32().max(0.001)).clamp(0.0, 1.0));
+        let time = match p.duration {
+            _ if p.track.is_none() => String::new(),
+            Some(d) => format!("{} / {}", player::clock(pos), player::clock(d)),
+            None => player::clock(pos),
+        };
+        let bounds_cell = self.progress_bounds.clone();
         div()
             .flex()
             .items_center()
@@ -1280,8 +1397,68 @@ impl Workspace {
             .border_t_1()
             .border_color(t.border)
             .text_color(t.text_muted)
-            .child(div().text_color(t.accent).child("▶"))
-            .child("Nothing playing")
+            .child(
+                div()
+                    .id("play")
+                    .w(px(28.))
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(t.bg_elevated)
+                    .hover(|s| s.bg(t.border))
+                    .text_color(t.accent)
+                    .child(if p.is_playing() { "❚❚" } else { "▶" })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_play(cx))),
+            )
+            .child(
+                div()
+                    .w(px(260.))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(div().text_color(t.text).truncate().child(title))
+                    .child(div().text_xs().truncate().child(artist)),
+            )
+            .child(
+                div()
+                    .id("progress")
+                    .flex_1()
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(4.))
+                            .rounded_full()
+                            .bg(t.bg_elevated)
+                            .child(div().absolute().left_0().top_0().h_full().w(relative(frac)).rounded_full().bg(t.accent))
+                            .child(
+                                canvas(move |b, _, _| bounds_cell.set(b), |_, _, _, _| {})
+                                    .absolute()
+                                    .size_full(),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                            let b = this.progress_bounds.get();
+                            let w = f32::from(b.size.width);
+                            if let (Some(d), true) = (this.player.duration, w > 0.0) {
+                                let f = (f32::from(e.position.x - b.origin.x) / w).clamp(0.0, 1.0);
+                                this.player.seek(d.mul_f32(f));
+                                cx.notify();
+                            }
+                        }),
+                    ),
+            )
+            .child(div().w(px(90.)).text_xs().child(time))
+            .children(p.error.clone().map(|e| div().text_xs().text_color(t.accent).child(e)))
     }
 
     fn palette(&self, mode: PaletteMode, t: &Theme) -> impl IntoElement {
@@ -1336,6 +1513,15 @@ impl Render for Workspace {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.open_folder(cx)))
+            .on_action(cx.listener(|this, _: &TogglePlay, _, cx| this.toggle_play(cx)))
+            .on_action(cx.listener(|this, _: &SkipBack, _, cx| {
+                this.player.skip(-10.0);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SkipForward, _, cx| {
+                this.player.skip(10.0);
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
                 // Esc peels back one layer: palette, picker, song selection, then the group.
                 if this.palette.is_some() {
@@ -1355,7 +1541,7 @@ impl Render for Workspace {
             .text_sm()
             .child(self.top_bar(&t, cx))
             .child(self.canvas_area(&t, window, cx))
-            .child(self.preview_bar(&t))
+            .child(self.preview_bar(&t, cx))
             .children(self.palette.map(|m| self.palette(m, &t)))
     }
 }
@@ -1377,6 +1563,9 @@ fn main() {
             KeyBinding::new("cmd-shift-p", CommandPalette, None),
             KeyBinding::new("cmd-o", OpenFolder, None),
             KeyBinding::new("escape", Dismiss, None),
+            KeyBinding::new("space", TogglePlay, Some("Workspace")),
+            KeyBinding::new("left", SkipBack, Some("Workspace")),
+            KeyBinding::new("right", SkipForward, Some("Workspace")),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());

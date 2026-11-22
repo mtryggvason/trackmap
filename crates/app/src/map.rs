@@ -498,6 +498,8 @@ pub fn key_color(k: Camelot) -> Hsla {
 
 struct DrawSong {
     pos: WorldPoint,
+    /// The song being played: drawn with an accent ring.
+    playing: bool,
     /// 1 when fully shown; less while fading in or out.
     alpha: f32,
     /// Lower is more important when titles compete for space.
@@ -543,6 +545,7 @@ impl Frame {
         shown: &[usize],
         selected: Option<NodeId>,
         route_of: Option<NodeId>,
+        playing: Option<usize>,
         hovered: Option<usize>,
         state: &MapState,
         theme: &Theme,
@@ -568,6 +571,7 @@ impl Frame {
         // Songs fading out are drawn first, underneath, and can't be clicked.
         let fading = anim.leaving.iter().map(|&(s, pos, a)| DrawSong {
             pos,
+            playing: false,
             alpha: a,
             label_priority: 4,
             art: arts.get(s).cloned().flatten(),
@@ -594,6 +598,7 @@ impl Frame {
                 let labelled = is_hover || in_focus || label_all;
                 DrawSong {
                     pos,
+                    playing: playing == Some(s),
                     alpha: anim.alpha.get(&s).copied().unwrap_or(1.0),
                     label_priority: if is_hover {
                         0
@@ -691,6 +696,13 @@ impl Frame {
                 ));
                 d
             };
+            if s.playing {
+                // A ring a few pixels outside the cover marks what's playing.
+                let r = d + px(8.);
+                let ring = Bounds::new(point(c.x - r / 2., c.y - r / 2.), size(r, r));
+                let radius = if s.art.is_some() { px(5.) } else { r / 2. };
+                window.paint_quad(quad(ring, radius, transparent_black(), px(2.5), t.accent, BorderStyle::Solid));
+            }
             let (cx_, cy_, half) = (f32::from(c.x), f32::from(c.y), f32::from(d) / 2.0);
             node_boxes.push(Rect { x0: cx_ - half, y0: cy_ - half, x1: cx_ + half, y1: cy_ + half });
         }

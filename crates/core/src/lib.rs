@@ -1,6 +1,7 @@
 //! Library model shared by the graph and the app. No UI code lives here.
 
 pub mod artwork;
+pub mod audio;
 pub mod cache;
 pub mod changes;
 pub mod key;

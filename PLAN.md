@@ -111,13 +111,19 @@ highlights its songs and dims the rest; they never appear as nodes.
 
 ## Preview
 
-- **Space** plays/pauses the selection. Clicking another song switches instantly.
-- Playback starts at 30% (configurable) so you skip the intro. A key cycles 25/50/75%.
-- Waveform in the inspector and preview bar, click to seek. Peaks are computed in the analysis pass
-  and cached.
-- The playing node pulses on the canvas.
-- **Arrow keys** jump to the nearest harmonic neighbour (compatible key, closest BPM) and preview it.
-- Output device picker (`cpal`) for headphones on a multi-output interface.
+Done (first version):
+- Click a song, then **Space** to play/pause it (or ▶ Play in the inspector). Space resumes or
+  restarts what's loaded when no other song is selected.
+- **← / →** jump back/forward 10 s.
+- Preview bar: play/pause, title and artist, elapsed / total, progress bar (click to seek).
+- The playing song has an orange ring on the map.
+- Decoding reuses the analysis decoder (symphonia) as a seekable stream; rodio only does output.
+
+Next:
+- Waveform in the inspector and preview bar (peaks computed in the analysis pass, cached).
+- Start position option (e.g. 30%) to skip intros.
+- Arrow keys to jump to the nearest compatible track (key ±1, close BPM) and preview it.
+- Output device picker (cpal) for headphones on a multi-output interface.
 
 ## Theme (Postman-like)
 

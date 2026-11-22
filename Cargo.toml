@@ -51,5 +51,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.symphonia-metadata]
 opt-level = 3
+# Audio output runs per sample in real time; unoptimised it can crackle.
+[profile.dev.package.rodio]
+opt-level = 3
+[profile.dev.package.cpal]
+opt-level = 3
 [profile.dev.package.trackmap-core]
 opt-level = 2

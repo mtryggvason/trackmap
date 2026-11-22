@@ -1,14 +1,18 @@
 mod theme;
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
+
+use futures::StreamExt;
 
 use gpui::{
     actions, div, point, prelude::*, px, size, uniform_list, App, Application, Bounds, Context,
     FocusHandle, KeyBinding, PathPromptOptions, SharedString, TitlebarOptions, Window,
     WindowBounds, WindowOptions,
 };
-use napworks_core::Library;
+use napworks_core::settings::Settings;
+use napworks_core::{Library, Watcher};
 use theme::Theme;
 
 actions!(napworks, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
@@ -30,11 +34,32 @@ struct Workspace {
     focus: FocusHandle,
     palette: Option<PaletteMode>,
     library: LibraryState,
+    /// Tracks added since the last time this library was open, or while it is open.
+    new_tracks: HashSet<PathBuf>,
+    only_new: bool,
+    /// Indices into `library.tracks` currently shown, after filters.
+    visible: Vec<usize>,
+    watcher: Option<Watcher>,
+    /// Bumped on every load so work for a previous library is discarded.
+    generation: u64,
+}
+
+fn settings_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("napworks").join("settings.json"))
 }
 
 impl Workspace {
     fn new(cx: &mut Context<Self>) -> Self {
-        Self { focus: cx.focus_handle(), palette: None, library: LibraryState::Empty }
+        Self {
+            focus: cx.focus_handle(),
+            palette: None,
+            library: LibraryState::Empty,
+            new_tracks: HashSet::new(),
+            only_new: false,
+            visible: Vec::new(),
+            watcher: None,
+            generation: 0,
+        }
     }
 
     fn open_folder(&mut self, cx: &mut Context<Self>) {
@@ -52,25 +77,89 @@ impl Workspace {
         .detach();
     }
 
-    /// Scans `root` on a background thread and shows the result.
+    /// Opens `root` on a background thread (using its cache), then watches it for changes.
     fn load(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        self.generation += 1;
+        let generation = self.generation;
+        self.watcher = None; // stops the previous watcher and its update loop
+        self.new_tracks.clear();
         self.library = LibraryState::Scanning(root.clone());
         cx.notify();
+
         cx.spawn(async move |this, cx| {
             let scan_root = root.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { napworks_core::scan(&scan_root) })
+                .spawn(async move { napworks_core::open(&scan_root) })
                 .await;
 
             this.update(cx, |ws, cx| {
-                ws.library = match result {
-                    Ok(lib) => LibraryState::Loaded(lib),
-                    Err(e) => LibraryState::Failed(root, e.to_string()),
-                };
+                if ws.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(report) => {
+                        remember_library(&report.library.root);
+                        ws.new_tracks = report.new.into_iter().collect();
+                        ws.library = LibraryState::Loaded(report.library);
+                        ws.start_watching(generation, cx);
+                    }
+                    Err(e) => ws.library = LibraryState::Failed(root, e.to_string()),
+                }
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Applies file-system changes to the open library as they happen.
+    fn start_watching(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let LibraryState::Loaded(lib) = &self.library else { return };
+        let root = lib.root.clone();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<Vec<PathBuf>>();
+        match napworks_core::watch(&root, move |paths| {
+            let _ = tx.unbounded_send(paths);
+        }) {
+            Ok(w) => self.watcher = Some(w),
+            Err(e) => {
+                eprintln!("napworks: not watching {}: {e}", root.display());
+                return;
+            }
+        }
+
+        cx.spawn(async move |this, cx| {
+            // Ends when the watcher (and with it the sender) is dropped.
+            while let Some(mut paths) = rx.next().await {
+                while let Ok(more) = rx.try_recv() {
+                    paths.extend(more);
+                }
+                let changes_root = root.clone();
+                let changes = cx
+                    .background_executor()
+                    .spawn(async move { napworks_core::changes_for(&changes_root, paths) })
+                    .await;
+                if changes.is_empty() {
+                    continue;
+                }
+
+                let snapshot = this.update(cx, |ws, cx| {
+                    if ws.generation != generation {
+                        return None;
+                    }
+                    let LibraryState::Loaded(lib) = &mut ws.library else { return None };
+                    let added = lib.apply(changes);
+                    ws.new_tracks.extend(added);
+                    cx.notify();
+                    Some(lib.clone())
+                });
+                let Ok(Some(lib)) = snapshot else { break };
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = napworks_core::cache::save(&lib);
+                    })
+                    .await;
+            }
         })
         .detach();
     }
@@ -132,7 +221,26 @@ impl Workspace {
             )
             .child(chip("BPM"))
             .child(chip("Key"))
-            .child(chip("New"))
+            .child(
+                div()
+                    .id("new-filter")
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(self.only_new, |d| d.bg(t.accent).text_color(t.bg_app))
+                    .when(!self.only_new, |d| {
+                        d.bg(t.bg_elevated).text_color(t.text_muted).hover(|s| s.text_color(t.text))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.only_new = !this.only_new;
+                        cx.notify();
+                    }))
+                    .child(match self.new_tracks.len() {
+                        0 => "New".to_string(),
+                        n => format!("New {n}"),
+                    }),
+            )
             .child(chip("Playlists"))
             .child(chip("Labels"))
             .child(div().flex_1())
@@ -176,12 +284,16 @@ impl Workspace {
     /// Temporary flat list until the graph canvas lands (milestone 5).
     fn track_list(&self, lib: &Library, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *t;
-        let summary = format!(
+        let mut summary = format!(
             "{} tracks  ·  {} artists  ·  {} labels",
             lib.tracks.len(),
             lib.artist_count(),
             lib.label_count()
         );
+        if self.only_new {
+            summary = format!("Showing {} new  ·  {summary}", self.visible.len());
+        }
+        let status = if self.watcher.is_some() { "● watching" } else { "not watching" };
         div()
             .flex_1()
             .flex()
@@ -193,26 +305,38 @@ impl Workspace {
                     .text_color(t.text_muted)
                     .border_b_1()
                     .border_color(t.border)
-                    .child(summary),
+                    .flex()
+                    .justify_between()
+                    .child(summary)
+                    .child(status),
             )
             .child(
                 uniform_list(
                     "tracks",
-                    lib.tracks.len(),
+                    self.visible.len(),
                     cx.processor(move |this, range: Range<usize>, _, _| {
                         let LibraryState::Loaded(lib) = &this.library else { return Vec::new() };
                         range
-                            .map(|i| {
+                            .filter_map(|row| this.visible.get(row).map(|&i| (row, i)))
+                            .map(|(row, i)| {
                                 let tr = &lib.tracks[i];
+                                let is_new = this.new_tracks.contains(&tr.path);
                                 let dash = || "—".to_string();
                                 div()
-                                    .id(i)
+                                    .id(row)
                                     .flex()
                                     .gap_3()
                                     .px_3()
                                     .h(px(26.))
                                     .items_center()
                                     .hover(|s| s.bg(t.bg_elevated))
+                                    .child(
+                                        div()
+                                            .w(px(36.))
+                                            .text_xs()
+                                            .text_color(t.accent)
+                                            .child(if is_new { "NEW" } else { "" }),
+                                    )
                                     .child(
                                         div()
                                             .w(px(360.))
@@ -297,6 +421,12 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *Theme::get(cx);
+        self.visible = match &self.library {
+            LibraryState::Loaded(lib) => (0..lib.tracks.len())
+                .filter(|&i| !self.only_new || self.new_tracks.contains(&lib.tracks[i].path))
+                .collect(),
+            _ => Vec::new(),
+        };
         div()
             .track_focus(&self.focus)
             .key_context("Workspace")
@@ -323,6 +453,15 @@ impl Render for Workspace {
             .child(self.canvas_area(&t, cx))
             .child(self.preview_bar(&t))
             .children(self.palette.map(|m| self.palette(m, &t)))
+    }
+}
+
+fn remember_library(root: &std::path::Path) {
+    let Some(path) = settings_path() else { return };
+    let mut settings = Settings::load(&path);
+    settings.last_library = Some(root.to_path_buf());
+    if let Err(e) = settings.save(&path) {
+        eprintln!("napworks: could not save settings: {e}");
     }
 }
 
@@ -353,9 +492,13 @@ fn main() {
                 |_, cx| {
                     cx.new(|cx| {
                         let mut ws = Workspace::new(cx);
-                        // `napworks <folder>` opens that folder straight away.
-                        if let Some(root) = std::env::args_os().nth(1) {
-                            ws.load(PathBuf::from(root), cx);
+                        // `napworks <folder>` opens that folder; otherwise reopen the last one.
+                        let root = std::env::args_os().nth(1).map(PathBuf::from).or_else(|| {
+                            let s = Settings::load(&settings_path()?);
+                            s.last_library.filter(|p| p.is_dir())
+                        });
+                        if let Some(root) = root {
+                            ws.load(root, cx);
                         }
                         ws
                     })

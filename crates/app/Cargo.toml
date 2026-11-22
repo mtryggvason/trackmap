@@ -5,5 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+dirs = "7.0.0"
+futures = "0.3.34"
 gpui.workspace = true
 napworks-core.workspace = true

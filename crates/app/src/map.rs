@@ -238,7 +238,7 @@ impl Frame {
         let t = &self.theme;
         let font = window.text_style().font();
 
-        // BPM axis along the bottom, key rows down the left.
+        // BPM axis along the bottom.
         let l = &self.layout;
         let muted: Hsla = t.text_muted.into();
         let axis_y = l.half_height + 36.;
@@ -248,16 +248,7 @@ impl Frame {
         }
         let s = tf.to_screen(WorldPoint { x: l.no_bpm_x(), y: axis_y });
         paint_text(window, cx, &font, "no BPM", 11., muted.opacity(0.6), s, true);
-        let label_x = l.no_bpm_x() - 70.;
-        for n in 1..=12u8 {
-            for minor in [true, false] {
-                let k = Camelot::new(n, minor).unwrap();
-                let s = tf.to_screen(WorldPoint { x: label_x, y: l.key_y(Some(k)) });
-                paint_text(window, cx, &font, &k.to_string(), 10., key_color(k).opacity(0.6), s, true);
-            }
-        }
-        let s = tf.to_screen(WorldPoint { x: label_x, y: l.key_y(None) });
-        paint_text(window, cx, &font, "?", 10., muted.opacity(0.6), s, true);
+
 
         // A selected playlist's route, in play order.
         if self.route.len() > 1 {

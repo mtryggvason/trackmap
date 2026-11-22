@@ -1,9 +1,8 @@
 //! The music graph. Only songs are drawn; artists, labels and playlists are groups of songs
 //! that can be selected to highlight their members.
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, HashMap};
+
 use std::path::PathBuf;
 
 use trackmap_core::{Playlist, Track};
@@ -75,8 +74,9 @@ impl Graph {
             g.song_artist.push(a);
             g.song_label.push(l);
             g.song_playlists.push(Vec::new());
-            g.song_pos.push(song_position(t, layout));
         }
+
+        g.song_pos = stack_positions(tracks, layout);
 
         g.artist_songs = vec![Vec::new(); g.artists.len()];
         g.label_songs = vec![Vec::new(); g.labels.len()];
@@ -191,18 +191,36 @@ impl Graph {
 
 }
 
-/// Layout position plus a small stable jitter, so songs with the same key and BPM don't
-/// sit exactly on top of each other.
-fn song_position(t: &Track, layout: &MapLayout) -> Point {
-    let mut h = DefaultHasher::new();
-    t.path.hash(&mut h);
-    let bits = h.finish();
-    let j1 = (bits & 0xFFFF) as f32 / 65535.0 * 2.0 - 1.0;
-    let j2 = ((bits >> 16) & 0xFFFF) as f32 / 65535.0 * 2.0 - 1.0;
+/// Places songs in BPM columns. Within a column songs are ordered by artist then title, so
+/// an artist's tracks at the same tempo sit together.
+fn stack_positions(tracks: &[Track], layout: &MapLayout) -> Vec<Point> {
+    let mut columns: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (i, t) in tracks.iter().enumerate() {
+        let col = match t.tempo().filter(|b| b.is_finite() && *b > 0.0) {
+            Some(b) => b.round() as i64,
+            None => i64::MIN,
+        };
+        columns.entry(col).or_default().push(i);
+    }
+    let lower = |s: &Option<String>| s.as_deref().unwrap_or("").to_lowercase();
+    let tallest = columns.values().map(Vec::len).max().unwrap_or(1);
+    let spacing = layout.stack_spacing(tallest);
 
-    let p = layout.position(t.key, t.tempo());
-    // Stay well inside the key row; a few world units sideways is a fraction of a BPM.
-    Point { x: p.x + j1 * 6.0, y: p.y + j2 * layout.row_height() * 0.35 }
+    let mut pos = vec![Point { x: 0.0, y: 0.0 }; tracks.len()];
+    for members in columns.values_mut() {
+        members.sort_by_key(|&i| {
+            let t = &tracks[i];
+            (lower(&t.artist), lower(&t.title), t.path.clone())
+        });
+        let n = members.len();
+        for (row, &i) in members.iter().enumerate() {
+            pos[i] = Point {
+                x: layout.column_x(tracks[i].tempo()),
+                y: layout.stack_y(row, n, spacing),
+            };
+        }
+    }
+    pos
 }
 
 #[cfg(test)]
@@ -282,6 +300,23 @@ mod tests {
         assert_eq!(g.songs_of(Artist(0)), [0, 1]);
         assert_eq!(g.songs_of(Label(0)), [0, 2]);
         assert_eq!(g.songs_of(Playlist(0)), [2, 0], "playlists keep play order");
+    }
+
+    #[test]
+    fn same_bpm_songs_share_a_column_sorted_by_artist() {
+        let tracks = vec![
+            track("/z", "Zed", "", "1A", 124.0),
+            track("/a", "Ann", "", "9B", 124.2),
+            track("/b", "Bob", "", "", 130.0),
+            track("/n", "Nia", "", "", 0.0),
+        ];
+        let g = Graph::build(&tracks, &[]);
+        let (z, a, b) = (g.song_position(0), g.song_position(1), g.song_position(2));
+        assert_eq!(z.x, a.x, "124 and 124.2 share a column");
+        assert!(a.y < z.y, "Ann above Zed");
+        assert!(b.x > a.x);
+        assert_eq!(b.y, 0.0, "a lone song is centred");
+        assert_eq!(g.song_position(3).x, g.layout.no_bpm_x());
     }
 
     #[test]

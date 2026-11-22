@@ -3,7 +3,6 @@
 mod model;
 
 pub use model::{Graph, NodeId, NodeKey};
-use trackmap_core::Camelot;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
@@ -11,9 +10,9 @@ pub struct Point {
     pub y: f32,
 }
 
-/// Tempo-first map. x = BPM (slow left, fast right) is the main axis; y = key in Camelot order
-/// with A/B pairs adjacent (1A, 1B, 2A, …) so compatible keys stay close. Songs without a key
-/// get a row below the keys, songs without a BPM a column left of the slowest tempo.
+/// Tempo map. x = BPM (slow left, fast right). Songs at the same (rounded) BPM stack into a
+/// column, centred vertically, so the map reads like a histogram of the library's tempos.
+/// Songs without a BPM get a column left of the slowest tempo.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MapLayout {
     pub bpm_min: f32,
@@ -23,8 +22,8 @@ pub struct MapLayout {
     pub half_height: f32,
 }
 
-/// 24 key rows plus one for unknown keys.
-const ROWS: f32 = 25.0;
+/// Vertical gap between stacked songs, at most; tall columns are squeezed to fit.
+const MAX_SPACING: f32 = 30.0;
 
 impl Default for MapLayout {
     fn default() -> Self {
@@ -63,26 +62,22 @@ impl MapLayout {
         -self.half_width - 80.0
     }
 
-    /// y of a key's row: 1A at the top, 12B second to last, unknown keys at the bottom.
-    pub fn key_y(&self, key: Option<Camelot>) -> f32 {
-        let row = match key {
-            Some(k) => ((k.number - 1) * 2 + u8::from(!k.minor)) as f32,
-            None => ROWS - 1.0,
-        };
-        -self.half_height + (row + 0.5) / ROWS * 2.0 * self.half_height
-    }
-
-    /// Height of one key row, used for jitter.
-    pub fn row_height(&self) -> f32 {
-        2.0 * self.half_height / ROWS
-    }
-
-    pub fn position(&self, key: Option<Camelot>, bpm: Option<f32>) -> Point {
-        let x = match bpm.filter(|b| *b > 0.0) {
-            Some(b) => self.bpm_x(b),
+    /// x of a song's column: its BPM rounded to a whole number, or the no-BPM column.
+    pub fn column_x(&self, bpm: Option<f32>) -> f32 {
+        match bpm.filter(|b| b.is_finite() && *b > 0.0) {
+            Some(b) => self.bpm_x(b.round()),
             None => self.no_bpm_x(),
-        };
-        Point { x, y: self.key_y(key) }
+        }
+    }
+
+    /// Vertical spacing so the tallest column fits in the layout's height.
+    pub fn stack_spacing(&self, tallest: usize) -> f32 {
+        (2.0 * self.half_height / tallest.max(1) as f32).min(MAX_SPACING)
+    }
+
+    /// y of the `i`th of `n` songs in a column, centred on 0.
+    pub fn stack_y(&self, i: usize, n: usize, spacing: f32) -> f32 {
+        (i as f32 - (n as f32 - 1.0) / 2.0) * spacing
     }
 
     /// BPM values to label along the axis: every 5 BPM for narrow ranges, otherwise every 10.
@@ -102,31 +97,25 @@ impl MapLayout {
 mod tests {
     use super::*;
 
-    fn k(s: &str) -> Option<Camelot> {
-        Some(s.parse().unwrap())
+    #[test]
+    fn columns_follow_rounded_bpm() {
+        let l = MapLayout::default();
+        assert!(l.column_x(Some(120.0)) < l.column_x(Some(130.0)));
+        assert_eq!(l.column_x(Some(123.6)), l.column_x(Some(124.0)));
+        assert_eq!(l.column_x(None), l.no_bpm_x());
+        assert_eq!(l.column_x(Some(0.0)), l.no_bpm_x());
+        assert!(l.no_bpm_x() < l.bpm_x(l.bpm_min));
     }
 
     #[test]
-    fn tempo_is_the_main_axis() {
+    fn stacks_are_centred_and_fit() {
         let l = MapLayout::default();
-        let a = l.position(k("8A"), Some(120.0));
-        let b = l.position(k("8A"), Some(130.0));
-        let c = l.position(k("8A"), Some(160.0));
-        assert!(a.x < b.x && b.x < c.x);
-        assert_eq!(a.y, b.y);
-        // A whole-library spread in BPM spans more distance than the whole key range.
-        assert!(2.0 * l.half_width > 2.0 * l.half_height);
-    }
-
-    #[test]
-    fn compatible_keys_are_adjacent_rows() {
-        let l = MapLayout::default();
-        let row = l.row_height();
-        let y = |s: &str| l.key_y(k(s));
-        assert!((y("8B") - y("8A") - row).abs() < 0.01, "relative major right below minor");
-        assert!((y("9A") - y("8A") - 2.0 * row).abs() < 0.01);
-        assert!(y("2A") < y("8A"));
-        assert!(l.key_y(None) > y("12B"), "unknown keys at the bottom");
+        assert_eq!(l.stack_spacing(3), MAX_SPACING);
+        let tall = l.stack_spacing(200);
+        assert!(tall * 199.0 <= 2.0 * l.half_height);
+        let ys: Vec<f32> = (0..3).map(|i| l.stack_y(i, 3, 30.0)).collect();
+        assert_eq!(ys, [-30.0, 0.0, 30.0]);
+        assert_eq!(l.stack_y(0, 1, 30.0), 0.0);
     }
 
     #[test]
@@ -150,10 +139,4 @@ mod tests {
         assert_eq!((l.bpm_min, l.bpm_max), (120.0, 140.0));
     }
 
-    #[test]
-    fn missing_bpm_gets_its_own_column() {
-        let l = MapLayout::default();
-        assert!(l.position(k("8A"), None).x < l.bpm_x(l.bpm_min));
-        assert_eq!(l.position(k("8A"), Some(0.0)).x, l.no_bpm_x());
-    }
 }

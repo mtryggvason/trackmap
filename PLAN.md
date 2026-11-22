@@ -62,13 +62,13 @@ crates/
 **Only songs are drawn.** Artists, labels and playlists are groups of songs. Selecting one
 highlights its songs and dims the rest; they never appear as nodes.
 
-**Layout (tempo first)**
-- x = BPM, slow left to fast right. The axis is fitted to the library's tempo range (rounded to
-  5 BPM) and labelled along the bottom. Songs without a BPM get a column on the far left.
-- y = key, secondary: Camelot rows with A/B pairs adjacent (1A, 1B, 2A, …), so relative
-  major/minor and neighbouring keys stay close. Songs without a key get a row at the bottom.
-- A small stable jitter keeps songs with the same key and BPM from stacking.
-- Songs are *not* grouped by artist/label/playlist in space; position is purely musical.
+**Layout (BPM only, for now)**
+- x = BPM, slow left to fast right, fitted to the library (ignoring the slowest/fastest 2%) and
+  labelled along the bottom. Songs without a BPM get a column on the far left.
+- Songs at the same rounded BPM stack into a centred column, ordered by artist then title, so
+  the map reads like a histogram of the library's tempos.
+- Key is shown only as the outline colour for now; it may come back as an axis once key
+  detection exists.
 
 **Selecting**
 - Click a song: it's highlighted, and the inspector lists its artist, label and playlists as links.

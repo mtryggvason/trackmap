@@ -20,7 +20,9 @@ use gpui::{
 use map::{Frame, MapState, Picker};
 use theme::Theme;
 use trackmap_core::settings::Settings;
-use trackmap_core::{artwork, playlists, tempo, Art, Library, Playlist, Watcher, PLAYLISTS_DIR};
+use trackmap_core::{
+    artwork, playlists, tags, tempo, Art, Library, Playlist, Watcher, PLAYLISTS_DIR,
+};
 use trackmap_graph::{Graph, NodeId};
 
 actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
@@ -64,6 +66,10 @@ struct Workspace {
     art_images: HashMap<String, Arc<RenderImage>>,
     art_running: bool,
     tempo_job: Option<TempoJob>,
+    /// Writing detected BPMs into files' tags.
+    writing_tags: bool,
+    /// Result of the last tag write, shown on the map.
+    notice: Option<SharedString>,
 }
 
 /// A running "Process BPM" pass.
@@ -124,7 +130,78 @@ impl Workspace {
             art_images: HashMap::new(),
             art_running: false,
             tempo_job: None,
+            writing_tags: false,
+            notice: None,
         }
+    }
+
+    /// Writes every detected BPM into its file's tags so the Pocket can sort by it.
+    fn write_bpm_tags(&mut self, cx: &mut Context<Self>) {
+        if self.writing_tags {
+            return;
+        }
+        let LibraryState::Loaded(lib) = &self.library else { return };
+        let todo = tags::bpm_to_write(&lib.tracks);
+        if todo.is_empty() {
+            return;
+        }
+        self.writing_tags = true;
+        self.notice = Some(format!("Writing BPM to {} files…", todo.len()).into());
+        let generation = self.generation;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let results = cx
+                .background_executor()
+                .spawn(async move {
+                    todo.into_iter()
+                        .map(|(p, bpm)| {
+                            let r = tags::write_bpm(&p, bpm).map_err(|e| e.to_string());
+                            (p, bpm, r)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let snapshot = this.update(cx, |ws, cx| {
+                ws.writing_tags = false;
+                if ws.generation != generation {
+                    return None;
+                }
+                let LibraryState::Loaded(lib) = &mut ws.library else { return None };
+                let failed: Vec<_> = results.iter().filter(|r| r.2.is_err()).collect();
+                let written = results.len() - failed.len();
+                // Reflect the new tags right away; the watcher will re-read the files too.
+                let ok: HashMap<&PathBuf, f32> = results
+                    .iter()
+                    .filter(|r| r.2.is_ok())
+                    .map(|(p, bpm, _)| (p, bpm.round()))
+                    .collect();
+                for t in &mut lib.tracks {
+                    if let Some(bpm) = ok.get(&t.path) {
+                        t.bpm = Some(*bpm);
+                    }
+                }
+                for (p, _, r) in &failed {
+                    eprintln!("trackmap: could not write BPM to {}: {}", p.display(), r.as_ref().unwrap_err());
+                }
+                ws.notice = Some(match failed.len() {
+                    0 => format!("Wrote BPM to {written} files").into(),
+                    n => format!("Wrote BPM to {written} files, {n} failed").into(),
+                });
+                let snapshot = lib.clone();
+                ws.rebuild_graph();
+                cx.notify();
+                Some(snapshot)
+            });
+            if let Ok(Some(lib)) = snapshot {
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = trackmap_core::cache::save(&lib);
+                    })
+                    .await;
+            }
+        })
+        .detach();
     }
 
     /// Detects BPM for every track without one, a few at a time, updating the map as it goes.
@@ -601,11 +678,24 @@ impl Workspace {
         }
         let LibraryState::Loaded(lib) = &self.library else { return None };
         let n = tempo::pending(&lib.tracks).len();
-        (n > 0).then(|| {
+        if n > 0 {
+            return Some(
+                base.text_color(t.text)
+                    .hover(|s| s.bg(t.bg_elevated))
+                    .child(format!("Process BPM ({n})"))
+                    .on_click(cx.listener(|this, _, _, cx| this.start_tempo(cx)))
+                    .into_any_element(),
+            );
+        }
+        let w = tags::bpm_to_write(&lib.tracks).len();
+        if self.writing_tags {
+            return Some(base.text_color(t.text_muted).child("Writing BPM…").into_any_element());
+        }
+        (w > 0).then(|| {
             base.text_color(t.text)
                 .hover(|s| s.bg(t.bg_elevated))
-                .child(format!("Process BPM ({n})"))
-                .on_click(cx.listener(|this, _, _, cx| this.start_tempo(cx)))
+                .child(format!("Write BPM to tags ({w})"))
+                .on_click(cx.listener(|this, _, _, cx| this.write_bpm_tags(cx)))
                 .into_any_element()
         })
     }
@@ -849,8 +939,9 @@ impl Workspace {
                     .text_xs()
                     .text_color(t.text_muted)
                     .child(format!(
-                        "{songs} songs shown  ·  {}",
-                        if self.watcher.is_some() { "● watching" } else { "not watching" }
+                        "{songs} songs shown  ·  {}{}",
+                        if self.watcher.is_some() { "● watching" } else { "not watching" },
+                        self.notice.as_ref().map(|n| format!("  ·  {n}")).unwrap_or_default()
                     )),
             )
             .child(

@@ -7,6 +7,7 @@ pub mod key;
 pub mod playlists;
 pub mod scan;
 pub mod settings;
+pub mod tags;
 pub mod tempo;
 pub mod watch;
 

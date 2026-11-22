@@ -24,7 +24,7 @@ use trackmap_core::{
     artwork, key_detect, playlists, tags, tempo, Art, Camelot, Library, Playlist, Watcher,
     PLAYLISTS_DIR,
 };
-use trackmap_graph::{Columns, Graph, NodeId};
+use trackmap_graph::{Graph, NodeId};
 
 actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
 
@@ -929,34 +929,39 @@ impl Workspace {
         // library's layout.
         let subset = shown.len() < graph.song_count();
         let layout = if subset && !shown.is_empty() { graph.layout_for(&shown) } else { graph.layout };
-        // A subset with few distinct tempos gets a flattened axis: one column per tempo.
-        let columns = if subset {
-            Columns::new(shown.iter().filter_map(|&s| graph.tempo(s)), layout.half_width)
-        } else {
-            None
-        };
-        // Otherwise tempo bins get finer as you zoom in, so a bin is about a cover wide on screen.
-        let bin = if columns.is_some() {
-            0.1
-        } else {
-            layout.bin_for(self.map.transform().scale(), (map::cover_size(self.map.zoom) * 1.3).max(14.0))
-        };
         let signature = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             shown.hash(&mut h);
             h.finish()
         };
-        let positions = match &self.map.positions {
-            Some((b, g, sig, p)) if *b == bin && Rc::ptr_eq(g, &graph) && *sig == signature => {
-                p.clone()
-            }
-            _ => {
-                let p = Rc::new(graph.positions(&layout, bin, columns.as_ref()));
-                self.map.positions = Some((bin, graph.clone(), signature, p.clone()));
-                p
+        // Positions (and the drawn axis) for a tempo bin width, cached per (bin, graph, shown).
+        let place = |bin: f32, cache: &mut Option<(f32, Rc<Graph>, u64, Rc<Vec<trackmap_graph::Point>>)>| {
+            match cache {
+                Some((b, g, sig, p)) if *b == bin && Rc::ptr_eq(g, &graph) && *sig == signature => p.clone(),
+                _ => {
+                    let axis = graph.axis_for(&shown, bin);
+                    let p = Rc::new(graph.positions(&layout, axis.as_ref()));
+                    *cache = Some((bin, graph.clone(), signature, p.clone()));
+                    p
+                }
             }
         };
+        // The camera frames the songs as laid out at normal zoom; pinching then magnifies, and
+        // the tempo bins get finer (1 → 0.5 → 0.2 → 0.1 BPM) so close tempos separate.
+        let base_bin = trackmap_graph::bin_for_zoom(1.0);
+        let bin = trackmap_graph::bin_for_zoom(self.map.zoom);
+        let base = place(base_bin, &mut self.map.base_positions);
+        let positions = place(bin, &mut self.map.positions);
+        let axis = graph.axis_for(&shown, bin);
+        let row = layout.row_height();
+        let slot = trackmap_graph::SLOT;
+        if let Some(target) = map::Fit::around(shown.iter().map(|&s| base[s]), slot * 0.7, row * 0.6) {
+            animating |= self.map.step_fit(target, now);
+        }
+        // Covers fill the space each song has on screen (a slot wide, a row high).
+        let scale = self.map.transform().scale();
+        self.map.cover = map::cover_px(slot * scale, row * scale);
         // Highlighting only applies to a song picked inside the view, not to the group itself.
         let highlight = selected.filter(|_| self.map.selected != self.map.scope);
         let route_of = selected.filter(|n| matches!(n, NodeId::Playlist(_))).or(scope);
@@ -969,7 +974,7 @@ impl Workspace {
         let (frame, drawn) = Frame::build(
             &graph,
             layout,
-            columns,
+            axis,
             has_no_bpm,
             &anim,
             &keys,

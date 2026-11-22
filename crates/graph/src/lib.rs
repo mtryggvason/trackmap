@@ -51,55 +51,88 @@ pub const BINS: [f32; 7] = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0];
 /// World width given to the no-BPM column.
 const NO_BPM_WIDTH: f32 = 60.0;
 
-/// A flattened BPM axis has at most this many columns; more fall back to the true scale.
-pub const MAX_COLUMNS: usize = 40;
-/// Gap between flattened columns, at most (so two columns don't sit at the far edges).
-const MAX_COLUMN_GAP: f32 = 260.0;
+/// Empty stretches of the BPM axis longer than this many bins are compressed to it.
+const MAX_GAP_BINS: f32 = 2.5;
 
-/// A flattened ("ordinal") BPM axis: one evenly spaced column per distinct tempo, in order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Columns {
-    /// Distinct tempos (to 0.1 BPM), ascending.
-    pub bpms: Vec<f32>,
-    /// World x of each column.
-    pub xs: Vec<f32>,
-    /// Distance between neighbouring columns.
-    pub gap: f32,
+/// World width of one occupied tempo bin on the drawn axis (about one key row high), so the
+/// map's width depends on how many tempos are present, not on the BPM range.
+pub const SLOT: f32 = 44.0;
+
+/// Tempo bin width for a zoom level: whole BPM at 1×, finer as you zoom in, coarser out.
+pub fn bin_for_zoom(zoom: f32) -> f32 {
+    let target = 1.0 / zoom.max(0.01);
+    BINS.into_iter().find(|b| *b >= target / 1.4).unwrap_or(BINS[BINS.len() - 1])
 }
 
-impl Columns {
-    /// Columns for these tempos, or `None` if there are too many to flatten.
-    pub fn new(tempos: impl IntoIterator<Item = f32>, half_width: f32) -> Option<Self> {
-        let mut bpms: Vec<f32> = tempos
+/// The BPM axis as actually drawn: one [`SLOT`] per bin, so neighbouring tempos keep their true
+/// spacing while empty stretches are compressed to a short break. Built for one bin width
+/// (which follows the zoom), so zooming in splits tempos more finely.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Axis {
+    /// Width of one bin in BPM.
+    pub bin: f32,
+    /// World width of one bin ([`SLOT`]).
+    pub cell: f32,
+    /// Occupied bins (index = round(bpm / bin)), ascending, with their world x.
+    pub knots: Vec<(i64, f32)>,
+    /// World x of the middle of each compressed gap, for drawing a break mark.
+    pub gaps: Vec<f32>,
+}
+
+impl Axis {
+    /// Axis for these tempos at `bin` BPM per bin, centred on 0. `None` if there are no tempos.
+    pub fn new(tempos: impl IntoIterator<Item = f32>, bin: f32) -> Option<Self> {
+        let mut idx: Vec<i64> = tempos
             .into_iter()
             .filter(|b| b.is_finite() && *b > 0.0)
-            .map(|b| (b * 10.0).round() / 10.0)
+            .map(|b| (b / bin).round() as i64)
             .collect();
-        bpms.sort_by(f32::total_cmp);
-        bpms.dedup();
-        if bpms.is_empty() || bpms.len() > MAX_COLUMNS {
-            return None;
+        idx.sort_unstable();
+        idx.dedup();
+        let first = *idx.first()?;
+        let cell = SLOT;
+        let (mut knots, mut gaps, mut x) = (vec![(first, 0.0)], Vec::new(), 0.0);
+        for w in idx.windows(2) {
+            let steps = (w[1] - w[0]) as f32;
+            let width = steps.min(MAX_GAP_BINS) * cell;
+            if steps > MAX_GAP_BINS {
+                gaps.push(x + width / 2.0);
+            }
+            x += width;
+            knots.push((w[1], x));
         }
-        let n = bpms.len();
-        let gap = if n > 1 { (2.0 * half_width / (n - 1) as f32).min(MAX_COLUMN_GAP) } else { MAX_COLUMN_GAP };
-        let start = -gap * (n as f32 - 1.0) / 2.0;
-        let xs = (0..n).map(|i| start + i as f32 * gap).collect();
-        Some(Self { bpms, xs, gap })
+        let shift = x / 2.0;
+        for k in &mut knots {
+            k.1 -= shift;
+        }
+        for g in &mut gaps {
+            *g -= shift;
+        }
+        Some(Self { bin, cell, knots, gaps })
     }
 
-    /// Column x for a tempo (nearest column).
+    /// World x for a tempo: exact for occupied bins, interpolated in between.
     pub fn x(&self, bpm: f32) -> f32 {
-        let v = (bpm * 10.0).round() / 10.0;
-        let i = match self.bpms.binary_search_by(|b| b.total_cmp(&v)) {
-            Ok(i) => i,
-            Err(i) => i.min(self.bpms.len() - 1),
-        };
-        self.xs[i]
+        let i = (bpm / self.bin).round() as i64;
+        match self.knots.binary_search_by_key(&i, |k| k.0) {
+            Ok(k) => self.knots[k].1,
+            Err(0) => self.knots[0].1,
+            Err(k) if k >= self.knots.len() => self.knots[self.knots.len() - 1].1,
+            Err(k) => {
+                let (a, b) = (self.knots[k - 1], self.knots[k]);
+                a.1 + (b.1 - a.1) * (i - a.0) as f32 / (b.0 - a.0) as f32
+            }
+        }
     }
 
-    /// x of the column for songs with no BPM: one gap left of the first column.
+    /// Tempo of each occupied bin with its x, for axis labels.
+    pub fn labels(&self) -> impl Iterator<Item = (f32, f32)> + '_ {
+        self.knots.iter().map(|(i, x)| (((*i as f32) * self.bin * 10.0).round() / 10.0, *x))
+    }
+
+    /// x of the column for songs with no BPM, left of the slowest tempo.
     pub fn no_bpm_x(&self) -> f32 {
-        self.xs[0] - self.gap.max(120.0)
+        self.knots[0].1 - (self.cell * 3.0).max(120.0)
     }
 }
 
@@ -249,19 +282,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flattened_columns_show_only_tempos_present() {
-        let c = Columns::new([135.0, 120.0, 123.0, 123.04], 900.0).unwrap();
-        assert_eq!(c.bpms, [120.0, 123.0, 135.0]);
-        // Evenly spaced and centred, whatever the BPM differences.
-        assert!((c.xs[1] - c.xs[0] - (c.xs[2] - c.xs[1])).abs() < 1e-3);
-        assert!((c.xs[0] + c.xs[2]).abs() < 1e-3);
-        assert_eq!(c.x(123.0), c.xs[1]);
-        assert!(c.no_bpm_x() < c.xs[0]);
-        // Two columns stay reasonably close instead of at the far edges.
-        let two = Columns::new([120.0, 128.0], 900.0).unwrap();
-        assert_eq!(two.gap, MAX_COLUMN_GAP);
-        assert!(Columns::new((0..60).map(|i| 100.0 + i as f32), 900.0).is_none());
-        assert!(Columns::new([], 900.0).is_none());
+    fn axis_compresses_gaps_and_keeps_true_spacing_where_songs_are() {
+        // 120, 121, 123 close together; 135 far away. 1 BPM bins, 10 world units per BPM.
+        let a = Axis::new([135.0, 120.0, 121.0, 123.0, 123.2], 1.0).unwrap();
+        let labels: Vec<f32> = a.labels().map(|(b, _)| b).collect();
+        assert_eq!(labels, [120.0, 121.0, 123.0, 135.0]);
+        assert_eq!(a.x(121.0) - a.x(120.0), SLOT, "neighbours keep true spacing");
+        assert_eq!(a.x(123.0) - a.x(121.0), 2.0 * SLOT, "a small gap stays proportional");
+        assert_eq!(a.x(135.0) - a.x(123.0), MAX_GAP_BINS * SLOT, "a big gap is compressed");
+        assert_eq!(a.gaps.len(), 1);
+        assert!((a.x(120.0) + a.x(135.0)).abs() < 1e-3, "centred");
+        assert!(a.x(122.0) > a.x(121.0) && a.x(122.0) < a.x(123.0), "in-between values interpolate");
+        assert!(a.no_bpm_x() < a.x(120.0));
+        assert!(Axis::new([], 1.0).is_none());
+    }
+
+    #[test]
+    fn zooming_in_splits_tempos_without_spreading_them_out() {
+        let tempos = [124.0, 124.3, 131.0];
+        let coarse = Axis::new(tempos, 1.0).unwrap();
+        let fine = Axis::new(tempos, 0.1).unwrap(); // zoomed in 10×
+        assert_eq!(coarse.labels().count(), 2, "124 and 124.3 share a bin");
+        assert_eq!(fine.labels().count(), 3, "zoomed in they separate");
+        // The 124 → 131 stretch is empty, so zoomed in it's a short break, not 67 slots.
+        assert!(fine.x(131.0) - fine.x(124.3) <= MAX_GAP_BINS * fine.cell + 1e-3);
+    }
+
+    #[test]
+    fn zoom_sets_the_bin() {
+        assert_eq!(bin_for_zoom(1.0), 1.0);
+        assert_eq!(bin_for_zoom(2.0), 0.5);
+        assert_eq!(bin_for_zoom(5.0), 0.2);
+        assert_eq!(bin_for_zoom(12.0), 0.1);
+        assert_eq!(bin_for_zoom(0.5), 2.0);
+        assert_eq!(bin_for_zoom(0.05), 10.0);
     }
 
     #[test]

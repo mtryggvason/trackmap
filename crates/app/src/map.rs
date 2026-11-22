@@ -1,5 +1,5 @@
-//! The song map: pan/zoom state, painting and hit-testing. Only songs are drawn; selecting an
-//! artist, label or playlist highlights its songs.
+//! The song map: pan/zoom state, painting and hit-testing. Only songs are drawn. The camera
+//! fits whatever is shown, and covers grow to fill the space they have.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -12,7 +12,7 @@ use gpui::{
     Pixels, Point, RenderImage, SharedString, TextRun, Window,
 };
 use trackmap_core::Camelot;
-use trackmap_graph::{Columns, Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint, KEY_ROWS};
+use trackmap_graph::{Axis, Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint, KEY_ROWS};
 
 /// How long transitions take.
 const TRANSITION: Duration = Duration::from_millis(320);
@@ -59,17 +59,56 @@ pub enum Picker {
 
 use crate::theme::Theme;
 
-/// World extent that fits the screen at zoom 1: the layout plus room for the key labels on
-/// the left, the no-BPM column, and the BPM axis below.
-const WORLD_HALF_W: f32 = 1060.0;
-const WORLD_HALF_H: f32 = 580.0;
 const HIT_RADIUS: f32 = 10.0;
+/// Screen space kept free for the key labels (left), the BPM axis (bottom) and the status line.
+const GUTTER_LEFT: f32 = 48.0;
+const GUTTER_BOTTOM: f32 = 44.0;
+const GUTTER_TOP: f32 = 30.0;
+/// Covers never get bigger than this, however few songs are shown.
+const MAX_COVER: f32 = 160.0;
+const MIN_COVER: f32 = 10.0;
 
-/// On-screen edge length of a cover at this zoom: grows gently as you zoom in.
-pub fn cover_size(zoom: f32) -> f32 {
-    (16.0 * zoom.sqrt()).clamp(14.0, 72.0)
+/// Cover size for the on-screen space a song has: a bit less than its slot width and row
+/// height (leaving room for its title), within sensible limits.
+pub fn cover_px(slot_px: f32, row_px: f32) -> f32 {
+    (slot_px * 0.82).min(row_px * 0.62).clamp(MIN_COVER, MAX_COVER)
 }
 
+/// The world-space box the camera fits to the screen at zoom 1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fit {
+    pub cx: f32,
+    pub cy: f32,
+    pub hw: f32,
+    pub hh: f32,
+}
+
+impl Default for Fit {
+    fn default() -> Self {
+        Self { cx: 0.0, cy: 0.0, hw: 1000.0, hh: 560.0 }
+    }
+}
+
+impl Fit {
+    /// Box around these positions, with room for a cover of `pad_x`/`pad_y` world units on
+    /// each side (plus its title below), never smaller than a minimum so a single song
+    /// doesn't fill the whole window.
+    pub fn around(points: impl IntoIterator<Item = WorldPoint>, pad_x: f32, pad_y: f32) -> Option<Self> {
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in points {
+            (x0, y0, x1, y1) = (x0.min(p.x), y0.min(p.y), x1.max(p.x), y1.max(p.y));
+        }
+        if x0 > x1 {
+            return None;
+        }
+        Some(Self {
+            cx: (x0 + x1) / 2.0,
+            cy: (y0 + y1) / 2.0 + pad_y * 0.25,
+            hw: ((x1 - x0) / 2.0 + pad_x).max(pad_x * 2.0),
+            hh: ((y1 - y0) / 2.0 + pad_y * 1.5).max(pad_y * 2.0),
+        })
+    }
+}
 pub struct MapState {
     /// Screen-space offset of the world origin from the canvas centre.
     pub pan: Point<Pixels>,
@@ -92,12 +131,19 @@ pub struct MapState {
     pub drawn: Vec<(usize, WorldPoint)>,
     /// Song positions for a (bin width, graph, shown songs) combination, reused until it changes.
     pub positions: Option<(f32, Rc<Graph>, u64, Rc<Vec<WorldPoint>>)>,
+    /// The same at normal zoom, which the camera frames.
+    pub base_positions: Option<(f32, Rc<Graph>, u64, Rc<Vec<WorldPoint>>)>,
     /// The layout and shown songs last drawn, and where each shown song actually was.
     last_target: Option<Rc<Vec<WorldPoint>>>,
     last_shown: Vec<usize>,
     current: HashMap<usize, WorldPoint>,
     songs_motion: Option<SongMotion>,
     view_motion: Option<ViewMotion>,
+    /// The box the camera currently fits (eased towards the shown songs' box).
+    pub fit: Fit,
+    fit_step: Option<Instant>,
+    /// Cover size in screen pixels this frame (also the click target size).
+    pub cover: f32,
 }
 
 impl Default for MapState {
@@ -115,11 +161,15 @@ impl Default for MapState {
             bounds: Rc::new(Cell::new(Bounds::default())),
             drawn: Vec::new(),
             positions: None,
+            base_positions: None,
             last_target: None,
             last_shown: Vec::new(),
             current: HashMap::new(),
             songs_motion: None,
             view_motion: None,
+            fit: Fit::default(),
+            fit_step: None,
+            cover: 16.0,
         }
     }
 }
@@ -131,11 +181,17 @@ pub struct Transform {
 }
 
 impl Transform {
-    pub fn new(bounds: Bounds<Pixels>, pan: Point<Pixels>, zoom: f32) -> Self {
-        let w = f32::from(bounds.size.width);
-        let h = f32::from(bounds.size.height);
-        let fit = (w / (2.0 * WORLD_HALF_W)).min(h / (2.0 * WORLD_HALF_H)).max(0.0001);
-        Self { center: bounds.center() + pan, scale: fit * zoom }
+    /// Fits `fit` into the canvas (minus the axis gutters), then applies pan and zoom.
+    pub fn new(bounds: Bounds<Pixels>, pan: Point<Pixels>, zoom: f32, fit: Fit) -> Self {
+        let w = (f32::from(bounds.size.width) - GUTTER_LEFT).max(1.0);
+        let h = (f32::from(bounds.size.height) - GUTTER_BOTTOM - GUTTER_TOP).max(1.0);
+        let scale = (w / (2.0 * fit.hw)).min(h / (2.0 * fit.hh)).max(0.0001) * zoom;
+        let inner = point(
+            bounds.origin.x + px(GUTTER_LEFT + w / 2.0),
+            bounds.origin.y + px(GUTTER_TOP + h / 2.0),
+        );
+        let center = inner + pan - point(px(fit.cx * scale), px(fit.cy * scale));
+        Self { center, scale }
     }
 
     /// Screen pixels per world unit.
@@ -157,7 +213,32 @@ impl Transform {
 
 impl MapState {
     pub fn transform(&self) -> Transform {
-        Transform::new(self.bounds.get(), self.pan, self.zoom)
+        Transform::new(self.bounds.get(), self.pan, self.zoom, self.fit)
+    }
+
+    /// Eases the camera's fit box towards `target`. Returns whether it's still moving.
+    pub fn step_fit(&mut self, target: Fit, now: Instant) -> bool {
+        let dt = self.fit_step.map_or(1.0, |t| (now - t).as_secs_f32()).min(0.1);
+        self.fit_step = Some(now);
+        // First frame: jump straight there.
+        if self.fit == Fit::default() {
+            self.fit = target;
+            return false;
+        }
+        let k = 1.0 - (-dt / 0.08).exp();
+        let f = &mut self.fit;
+        let mix = |a: &mut f32, b: f32| *a += (b - *a) * k;
+        mix(&mut f.cx, target.cx);
+        mix(&mut f.cy, target.cy);
+        mix(&mut f.hw, target.hw);
+        mix(&mut f.hh, target.hh);
+        let close = |a: f32, b: f32| (a - b).abs() <= 0.002 * target.hw.max(target.hh);
+        if close(f.cx, target.cx) && close(f.cy, target.cy) && close(f.hw, target.hw) && close(f.hh, target.hh) {
+            self.fit = target;
+            false
+        } else {
+            true
+        }
     }
 
     /// Topmost song under the cursor.
@@ -172,7 +253,7 @@ impl MapState {
                 (n, dx * dx + dy * dy)
             })
             .filter(|&(_, d2)| {
-                let r = HIT_RADIUS.max(cover_size(self.zoom) / 2.0);
+                let r = HIT_RADIUS.max(self.cover / 2.0);
                 d2 <= r * r
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
@@ -319,9 +400,12 @@ pub struct Frame {
     /// A selected playlist's songs in play order.
     route: Vec<WorldPoint>,
     layout: MapLayout,
-    /// Flattened BPM axis, if this view uses one.
-    columns: Option<Columns>,
+    /// The drawn BPM axis (compressed gaps), if any song has a tempo.
+    axis: Option<Axis>,
     has_no_bpm: bool,
+    /// Cover size in screen pixels.
+    cover: f32,
+    fit: Fit,
     pan: Point<Pixels>,
     zoom: f32,
     theme: Theme,
@@ -334,7 +418,7 @@ impl Frame {
     pub fn build(
         graph: &Graph,
         layout: MapLayout,
-        columns: Option<Columns>,
+        axis: Option<Axis>,
         has_no_bpm: bool,
         anim: &Animated,
         keys: &[Option<Camelot>],
@@ -425,11 +509,23 @@ impl Frame {
             _ => Vec::new(),
         };
 
-        (Self { songs, route, layout, columns, has_no_bpm, pan: state.pan, zoom: state.zoom, theme: *theme }, drawn)
+        let frame = Self {
+            songs,
+            route,
+            layout,
+            axis,
+            has_no_bpm,
+            cover: state.cover,
+            fit: state.fit,
+            pan: state.pan,
+            zoom: state.zoom,
+            theme: *theme,
+        };
+        (frame, drawn)
     }
 
     pub fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
-        let tf = Transform::new(bounds, self.pan, self.zoom);
+        let tf = Transform::new(bounds, self.pan, self.zoom, self.fit);
         let t = &self.theme;
         let font = window.text_style().font();
 
@@ -448,14 +544,14 @@ impl Frame {
             }
         }
 
-        let cover = cover_size(self.zoom);
+        let cover = self.cover;
         let bg: Hsla = t.bg_app.into();
         let mut node_boxes = Vec::with_capacity(self.songs.len());
         for s in &self.songs {
             let c = tf.to_screen(s.pos);
             let d = if let Some(img) = &s.art {
                 // Cover: image, a dimming veil when out of focus, then the key-coloured outline.
-                let d = px(if s.big { cover * 1.5 } else { cover });
+                let d = px(if s.big { (cover * 1.3).min(MAX_COVER * 1.15) } else { cover });
                 let b = Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d));
                 let radius = px(3.);
                 let _ = window.paint_image(b, b, radius.into(), img.clone(), 0, s.dimmed);
@@ -526,29 +622,26 @@ impl Frame {
         let strip = Bounds::new(point(bounds.origin.x, axis_y - px(10.)), size(bounds.size.width, px(20.)));
         window.paint_quad(quad(strip, px(0.), bg.opacity(0.85), px(0.), bg, BorderStyle::Solid));
         let fmt = |bpm: f32, fine: bool| if fine || bpm.fract() != 0.0 { format!("{bpm:.1}") } else { format!("{bpm:.0}") };
-        let no_bpm_world = match &self.columns {
-            Some(c) => {
-                // Flattened: label exactly the tempos present, skipping any that would collide.
+        let no_bpm_world = match &self.axis {
+            Some(axis) => {
+                // Label the tempos that have songs, skipping any that would collide; compressed
+                // empty stretches get a break mark.
+                let fine = axis.bin < 1.0;
                 let mut last = f32::MIN;
-                for (bpm, x) in c.bpms.iter().zip(&c.xs) {
-                    let sx = tf.to_screen(WorldPoint { x: *x, y: 0. }).x;
-                    if f32::from(sx) - last >= 36.0 {
-                        paint_text(window, cx, &font, &fmt(*bpm, false), 11., muted, point(sx, axis_y), true);
+                for (bpm, x) in axis.labels() {
+                    let sx = tf.to_screen(WorldPoint { x, y: 0. }).x;
+                    if f32::from(sx) - last >= 34.0 {
+                        paint_text(window, cx, &font, &fmt(bpm, fine), 11., muted, point(sx, axis_y), true);
                         last = f32::from(sx);
                     }
                 }
-                c.no_bpm_x()
-            }
-            None => {
-                let left = tf.to_world(bounds.origin).x;
-                let right = tf.to_world(point(bounds.origin.x + bounds.size.width, bounds.origin.y)).x;
-                let (step, ticks) = l.bpm_ticks(l.x_bpm(left), l.x_bpm(right), tf.scale(), 56.0);
-                for bpm in ticks {
-                    let x = tf.to_screen(WorldPoint { x: l.bpm_x(bpm), y: 0. }).x;
-                    paint_text(window, cx, &font, &fmt(bpm, step < 1.0), 11., muted, point(x, axis_y), true);
+                for g in &axis.gaps {
+                    let sx = tf.to_screen(WorldPoint { x: *g, y: 0. }).x;
+                    paint_text(window, cx, &font, "⋯", 11., muted.opacity(0.5), point(sx, axis_y), true);
                 }
-                l.no_bpm_x()
+                axis.no_bpm_x()
             }
+            None => l.no_bpm_x(),
         };
         let no_bpm = tf.to_screen(WorldPoint { x: no_bpm_world, y: 0. }).x;
         if self.has_no_bpm && no_bpm > bounds.origin.x {
@@ -791,13 +884,61 @@ mod tests {
     }
 
     #[test]
+    fn fit_frames_a_few_songs_big() {
+        let pts = [WorldPoint { x: -50., y: 0. }, WorldPoint { x: 0., y: 0. }, WorldPoint { x: 50., y: 20. }];
+        let f = Fit::around(pts, 40., 30.).unwrap();
+        assert_eq!((f.cx, f.hw), (0., 90.));
+        let mut s = MapState::default();
+        s.bounds.set(Bounds::new(point(px(0.), px(0.)), size(px(1248.), px(874.))));
+        s.fit = f;
+        // Three songs 100 world units apart fill most of a 1200 px wide canvas.
+        let tf = s.transform();
+        let span = f32::from(tf.to_screen(pts[2]).x - tf.to_screen(pts[0]).x);
+        assert!(span > 500.0, "span {span}");
+        assert!(Fit::around([], 1., 1.).is_none());
+    }
+
+    #[test]
+    fn covers_grow_with_space_up_to_a_limit() {
+        assert_eq!(cover_px(20., 20.), 12.4);
+        assert_eq!(cover_px(100., 400.), 82.);
+        assert_eq!(cover_px(1000., 1000.), MAX_COVER);
+        assert_eq!(cover_px(2., 2.), MIN_COVER);
+    }
+
+    #[test]
+    fn fit_eases_towards_its_target() {
+        let mut s = MapState::default();
+        let t0 = Instant::now();
+        let a = Fit { cx: 0., cy: 0., hw: 500., hh: 300. };
+        assert!(!s.step_fit(a, t0), "first frame jumps");
+        let b = Fit { cx: 100., cy: 0., hw: 100., hh: 60. };
+        assert!(s.step_fit(b, t0 + Duration::from_millis(16)));
+        assert!(s.fit.hw < 500. && s.fit.hw > 100.);
+        let mut t = t0;
+        for _ in 0..200 {
+            t += Duration::from_millis(16);
+            if !s.step_fit(b, t) {
+                break;
+            }
+        }
+        assert_eq!(s.fit, b);
+    }
+
+    #[test]
     fn hit_finds_nearest_node() {
         let mut s = MapState::default();
-        s.bounds.set(Bounds::new(point(px(0.), px(0.)), size(px(1060.), px(580.))));
-        // scale = 0.5 on both axes, centre = (530, 290)
+        // Inner area 1000 × 500 after gutters; fit box 1000 × 500 world → scale 0.5.
+        s.bounds.set(Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(1000. + GUTTER_LEFT), px(500. + GUTTER_TOP + GUTTER_BOTTOM)),
+        ));
+        s.fit = Fit { cx: 0., cy: 0., hw: 1000., hh: 500. };
+        let c = s.transform().to_screen(WorldPoint { x: 0., y: 0. });
+        assert_eq!((c.x, c.y), (px(GUTTER_LEFT + 500.), px(GUTTER_TOP + 250.)));
         s.drawn = vec![(0, WorldPoint { x: 0., y: 0. }), (1, WorldPoint { x: 30., y: 0. })];
-        assert_eq!(s.hit(point(px(532.), px(290.))), Some(0));
-        assert_eq!(s.hit(point(px(544.), px(290.))), Some(1));
-        assert_eq!(s.hit(point(px(700.), px(400.))), None);
+        assert_eq!(s.hit(c + point(px(2.), px(0.))), Some(0));
+        assert_eq!(s.hit(c + point(px(14.), px(0.))), Some(1));
+        assert_eq!(s.hit(c + point(px(200.), px(100.))), None);
     }
 }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use trackmap_core::{Camelot, Playlist, Track};
 
-use crate::{Columns, MapLayout, Point};
+use crate::{Axis, MapLayout, Point};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
@@ -164,6 +164,11 @@ impl Graph {
         v.to_vec()
     }
 
+    /// The drawn BPM axis for these songs at `bin` BPM per bin.
+    pub fn axis_for(&self, songs: &[usize], bin: f32) -> Option<Axis> {
+        Axis::new(songs.iter().filter_map(|&s| self.song_tempo[s]), bin)
+    }
+
     /// A song's tempo (tag or detected).
     pub fn tempo(&self, song: usize) -> Option<f32> {
         self.song_tempo[song]
@@ -191,11 +196,10 @@ impl Graph {
     /// Every song's position in `layout` with tempo grouped into bins of `bin` BPM: x is the
     /// bin, y the key row, and songs sharing a cell are spread evenly across it (by artist,
     /// then title).
-    /// With `columns`, x is the song's flattened tempo column instead of its place on the
-    /// true scale (and `bin` is ignored).
-    pub fn positions(&self, layout: &MapLayout, bin: f32, columns: Option<&Columns>) -> Vec<Point> {
+    /// x comes from `axis` (which fixes the bin width and compresses empty stretches).
+    pub fn positions(&self, layout: &MapLayout, axis: Option<&Axis>) -> Vec<Point> {
         let l = layout;
-        let bin = if columns.is_some() { 0.1 } else { bin };
+        let bin = axis.map_or(1.0, |a| a.bin);
         let mut cells: BTreeMap<(i64, usize), Vec<usize>> = BTreeMap::new();
         for s in 0..self.song_count() {
             let col = match self.song_tempo[s].filter(|b| b.is_finite() && *b > 0.0) {
@@ -209,9 +213,9 @@ impl Graph {
             members.sort_by_key(|&s| self.song_rank[s]);
             let n = members.len();
             let tempo = self.song_tempo[members[0]].filter(|b| b.is_finite() && *b > 0.0);
-            let (cx, width) = match (columns, tempo) {
-                (Some(c), Some(b)) => (c.x(b), c.gap),
-                (Some(c), None) => (c.no_bpm_x(), c.gap.min(120.0)),
+            let (cx, width) = match (axis, tempo) {
+                (Some(a), Some(b)) => (a.x(b), a.cell),
+                (Some(a), None) => (a.no_bpm_x(), a.cell.max(60.0)),
                 (None, _) => l.cell_x(tempo, bin),
             };
             // Use up to 80% of the cell so neighbouring cells stay apart.
@@ -334,7 +338,7 @@ mod tests {
         let g = Graph::build(&tracks, &[]);
 
         // Whole-BPM bins: Zed and Ann share the 124/8A cell, side by side, Ann first.
-        let p = g.positions(&g.layout, 1.0, None);
+        let p = g.positions(&g.layout, None);
         assert_eq!(p[0].y, p[1].y);
         assert!(p[1].x < p[0].x, "Ann before Zed");
         let centre = g.layout.bpm_x(124.0);
@@ -345,17 +349,16 @@ mod tests {
         assert_eq!(p[3].y, g.layout.row_y(crate::KEY_ROWS - 1));
 
         // Zoomed in to 0.1 BPM bins, 124.0 and 124.3 separate and each sits at its own BPM.
-        let p = g.positions(&g.layout, 0.1, None);
-        assert!((p[0].x - g.layout.bpm_x(124.0)).abs() < 1e-3);
-        assert!((p[1].x - g.layout.bpm_x(124.3)).abs() < 1e-2);
+        let fine = g.axis_for(&[0, 1, 2, 3], 0.1).unwrap();
+        let p = g.positions(&g.layout, Some(&fine));
+        let d = p[1].x - p[0].x;
+        assert!(d > 0.0, "124.3 sits right of 124.0");
+        assert!(d <= 3.0 * fine.cell + 1e-2, "and no further than 3 fine bins (empty bins compress)");
+
+        // Songs without a BPM sit left of the axis.
+        assert!(p[3].x < p[0].x);
 
         // Fitted to Zed and Bob only: one tempo, two keys, so just two rows.
-        // Flattened: Ann (124.3) and Zed/Bob (124.0) get neighbouring columns.
-        let cols = Columns::new([124.0, 124.3], g.layout.half_width).unwrap();
-        let p = g.positions(&g.layout, 1.0, Some(&cols));
-        assert_eq!((p[0].x, p[1].x), (cols.xs[0], cols.xs[1]));
-        assert_eq!(p[3].x, cols.no_bpm_x());
-
         let sub = g.layout_for(&[0, 2]);
         assert_eq!(sub.rows(), [14, 16]);
         assert!(sub.bpm_min <= 124.0 && sub.bpm_max >= 124.0);

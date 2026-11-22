@@ -63,16 +63,17 @@ crates/
 highlights its songs and dims the rest; they never appear as nodes.
 
 **Layout (tempo × key)**
-- x = BPM, slow left to fast right, fitted to the library (ignoring the slowest/fastest 2%).
-  Songs are grouped into tempo bins whose width follows the zoom (2 → 1 → 0.5 → 0.2 → 0.1 BPM),
-  so zooming in on a tempo separates songs more precisely. Songs without a BPM get a column on
-  the far left.
+- x = BPM. Each occupied tempo bin gets one fixed-width slot, so neighbouring tempos keep their
+  true spacing while empty stretches are compressed to a short break (marked ⋯ on the axis).
+  Labels show the tempos that have songs.
+- Zoom sets the precision: whole BPM at 1×, 0.5 at 2×, 0.2 at 5×, 0.1 at 10×; coarser when
+  zoomed out. Songs glide as bins split.
 - y = key, in Camelot order with A/B pairs adjacent (1A, 1B, 2A, …), unknown keys at the bottom.
-- Songs in the same bin and key sit side by side, ordered by artist then title.
-- Axes are pinned to the canvas edges: BPM along the bottom (labels get finer as you zoom),
-  keys down the left.
-- Titles sit centred under their covers; when titles would overlap each other or another song,
-  only the most important (hovered, selected, then the rest) is drawn.
+  Subsets only show the keys they contain.
+- The camera always frames the shown songs (at 1× zoom), easing when the set changes; covers
+  size themselves to the space each song has (up to 160 px), so three songs are big and a whole
+  library is small.
+- Titles sit centred under their covers and never overlap.
 
 **Selecting**
 - Picking an artist, label or playlist narrows the map to its songs: everything else disappears

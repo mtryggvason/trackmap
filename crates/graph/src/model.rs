@@ -100,6 +100,8 @@ impl Graph {
         g.label_songs = vec![Vec::new(); g.labels.len()];
         g.label_artists = vec![Vec::new(); g.labels.len()];
         g.album_songs = vec![Vec::new(); g.albums.len()];
+        // (label, artist) pairs already recorded, so this stays linear in the number of tracks.
+        let mut seen_label_artist = std::collections::HashSet::new();
         for s in 0..tracks.len() {
             if let Some(al) = g.song_album[s] {
                 g.album_songs[al].push(s);
@@ -110,7 +112,7 @@ impl Graph {
             if let Some(l) = g.song_label[s] {
                 g.label_songs[l].push(s);
                 if let Some(a) = g.song_artist[s] {
-                    if !g.label_artists[l].contains(&a) {
+                    if seen_label_artist.insert((l, a)) {
                         g.label_artists[l].push(a);
                     }
                 }

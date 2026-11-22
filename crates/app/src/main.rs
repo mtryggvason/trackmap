@@ -1053,15 +1053,6 @@ impl Workspace {
     }
 
     fn top_bar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let chip = |label: &'static str| {
-            div()
-                .px_2()
-                .py_0p5()
-                .rounded_md()
-                .bg(t.bg_elevated)
-                .text_color(t.text_muted)
-                .child(label)
-        };
         let t2 = *t;
         let toggle = move |id: &'static str, label: SharedString, on: bool| {
             div()
@@ -1145,8 +1136,6 @@ impl Workspace {
                         )
                     }),
             )
-            .child(chip("BPM"))
-            .child(chip("Key"))
             .child(
                 toggle(
                     "new-filter",

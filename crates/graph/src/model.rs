@@ -1,7 +1,8 @@
-//! The music graph: songs, artists, labels and playlists, and which of them are visible.
+//! The music graph. Only songs are drawn; artists, labels and playlists are groups of songs
+//! that can be selected to highlight their members.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
@@ -44,9 +45,6 @@ pub struct Graph {
     playlist_songs: Vec<Vec<usize>>,
 
     song_pos: Vec<Point>,
-    artist_pos: Vec<Point>,
-    label_pos: Vec<Point>,
-    playlist_pos: Vec<Point>,
 }
 
 /// Interns strings into indices, keeping first-seen order.
@@ -105,10 +103,6 @@ impl Graph {
             }
             g.playlist_songs.push(songs);
         }
-
-        g.artist_pos = g.artist_songs.iter().map(|s| g.orbit(s, 70.0)).collect();
-        g.label_pos = g.label_songs.iter().map(|s| g.orbit(s, 140.0)).collect();
-        g.playlist_pos = g.playlist_songs.iter().map(|s| g.orbit(s, 210.0)).collect();
         g
     }
 
@@ -144,14 +138,16 @@ impl Graph {
         &self.song_playlists[song]
     }
 
-    /// Songs belonging to an artist, label or playlist (empty for a song).
-    pub fn songs_of(&self, n: NodeId) -> &[usize] {
-        match n {
-            NodeId::Song(_) => &[],
+    /// The songs a selection highlights: the song itself, or a group's songs
+    /// (a playlist's in play order).
+    pub fn songs_of(&self, n: NodeId) -> Vec<usize> {
+        let v: &[usize] = match n {
+            NodeId::Song(i) => return vec![i],
             NodeId::Artist(i) => &self.artist_songs[i],
             NodeId::Label(i) => &self.label_songs[i],
             NodeId::Playlist(i) => &self.playlist_songs[i],
-        }
+        };
+        v.to_vec()
     }
 
     pub fn song_count(&self) -> usize {
@@ -167,16 +163,11 @@ impl Graph {
         }
     }
 
-    pub fn position(&self, n: NodeId) -> Point {
-        match n {
-            NodeId::Song(i) => self.song_pos[i],
-            NodeId::Artist(i) => self.artist_pos[i],
-            NodeId::Label(i) => self.label_pos[i],
-            NodeId::Playlist(i) => self.playlist_pos[i],
-        }
+    pub fn song_position(&self, song: usize) -> Point {
+        self.song_pos[song]
     }
 
-    /// What clicking a node reveals.
+    /// What the inspector lists for a selection.
     /// Song: its artist, label and playlists. Artist: its songs. Label: its artists.
     /// Playlist: its songs.
     pub fn neighbours(&self, n: NodeId) -> Vec<NodeId> {
@@ -195,69 +186,6 @@ impl Graph {
         }
     }
 
-    /// Edges among a set of visible nodes (sorted, as returned by [`Graph::visible`]).
-    pub fn edges(&self, visible: &[NodeId]) -> Vec<(NodeId, NodeId)> {
-        let is_visible = |n: &NodeId| visible.binary_search(n).is_ok();
-        let mut out = Vec::new();
-        for &n in visible {
-            match n {
-                NodeId::Song(s) => {
-                    for other in self.neighbours(NodeId::Song(s)) {
-                        if is_visible(&other) {
-                            out.push((n, other));
-                        }
-                    }
-                }
-                NodeId::Label(l) => {
-                    for &a in &self.label_artists[l] {
-                        if is_visible(&NodeId::Artist(a)) {
-                            out.push((n, NodeId::Artist(a)));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        out
-    }
-
-    /// Visible nodes: the filtered songs, optionally every playlist/label, plus every expanded
-    /// node and what it reveals. Returned sorted and without duplicates.
-    pub fn visible(
-        &self,
-        songs: impl IntoIterator<Item = usize>,
-        all_playlists: bool,
-        all_labels: bool,
-        expanded: &[NodeId],
-    ) -> Vec<NodeId> {
-        let mut set: BTreeSet<NodeId> = songs.into_iter().map(NodeId::Song).collect();
-        if all_playlists {
-            set.extend((0..self.playlists.len()).map(NodeId::Playlist));
-        }
-        if all_labels {
-            set.extend((0..self.labels.len()).map(NodeId::Label));
-        }
-        for &n in expanded {
-            set.insert(n);
-            set.extend(self.neighbours(n));
-        }
-        set.into_iter().collect()
-    }
-
-    /// Places a group node just outside the centroid of its songs, pushed away from the centre.
-    fn orbit(&self, songs: &[usize], distance: f32) -> Point {
-        if songs.is_empty() {
-            return Point { x: 0.0, y: -distance };
-        }
-        let n = songs.len() as f32;
-        let (sx, sy) = songs.iter().fold((0.0, 0.0), |(x, y), &s| {
-            (x + self.song_pos[s].x, y + self.song_pos[s].y)
-        });
-        let (cx, cy) = (sx / n, sy / n);
-        let len = (cx * cx + cy * cy).sqrt();
-        let (dx, dy) = if len < 1.0 { (0.0, -1.0) } else { (cx / len, cy / len) };
-        Point { x: cx + dx * distance, y: cy + dy * distance }
-    }
 }
 
 /// Harmonic position plus a small stable jitter, so songs with the same key and BPM don't
@@ -326,7 +254,7 @@ mod tests {
         assert_eq!(g2.find(&g.key(NodeId::Song(0))), Some(NodeId::Song(1)));
         assert_eq!(g2.find(&NodeKey::Playlist("Warmup".into())), None);
         assert_eq!(g2.songs_of(NodeId::Artist(1)), [1, 2, 3]);
-        assert!(g2.songs_of(NodeId::Song(0)).is_empty());
+        assert_eq!(g2.songs_of(NodeId::Song(0)), [0]);
     }
 
     #[test]
@@ -349,38 +277,22 @@ mod tests {
     }
 
     #[test]
-    fn visibility_and_edges() {
+    fn selections_highlight_songs() {
         use NodeId::*;
         let g = sample();
-        // Only the "new" song 2 is in the filter; expanding Ann reveals her songs too.
-        let v = g.visible([2], false, false, &[Artist(0)]);
-        assert_eq!(v, [Song(0), Song(1), Song(2), Artist(0)]);
-        assert_eq!(g.edges(&v), [(Song(0), Artist(0)), (Song(1), Artist(0))]);
-
-        let v = g.visible([], true, true, &[]);
-        assert_eq!(v, [Label(0), Label(1), Playlist(0)]);
-        assert!(g.edges(&v).is_empty());
-
-        // Label -> artist edges once both are visible.
-        let v = g.visible([], false, false, &[Label(0)]);
-        assert_eq!(g.edges(&v), [(Label(0), Artist(0)), (Label(0), Artist(1))]);
+        assert_eq!(g.songs_of(Song(3)), [3]);
+        assert_eq!(g.songs_of(Artist(0)), [0, 1]);
+        assert_eq!(g.songs_of(Label(0)), [0, 2]);
+        assert_eq!(g.songs_of(Playlist(0)), [2, 0], "playlists keep play order");
     }
 
     #[test]
     fn positions_are_stable_and_compatible_keys_cluster() {
         let (a, b) = (sample(), sample());
         let d = |p: Point, q: Point| ((p.x - q.x).powi(2) + (p.y - q.y).powi(2)).sqrt();
-        assert_eq!(a.position(NodeId::Song(0)), b.position(NodeId::Song(0)));
+        assert_eq!(a.song_position(0), b.song_position(0));
         // 8A and 9A are neighbours on the wheel; 2B is across it.
-        let (s0, s1, s2) = (
-            a.position(NodeId::Song(0)),
-            a.position(NodeId::Song(1)),
-            a.position(NodeId::Song(2)),
-        );
+        let (s0, s1, s2) = (a.song_position(0), a.song_position(1), a.song_position(2));
         assert!(d(s0, s1) < d(s0, s2));
-        // Ann's node sits outside the middle of her songs.
-        let ann = a.position(NodeId::Artist(0));
-        let mid = Point { x: (s0.x + s1.x) / 2.0, y: (s0.y + s1.y) / 2.0 };
-        assert!(d(ann, mid) > 60.0 && d(ann, mid) < 80.0);
     }
 }

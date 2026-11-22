@@ -57,31 +57,28 @@ crates/
 | Hit-testing | `rstar` spatial index |
 | Preview audio | `rodio` (on `cpal` + `symphonia`) on a dedicated audio thread, controlled through a channel |
 
-## Graph
+## Map
 
-**Nodes:** Song, Artist, Label, Playlist.
-**Edges:** song–artist, song–label, song–playlist, and label–artist (derived: the artist has ≥1 track
-on the label, edge weight = track count).
+**Only songs are drawn.** Artists, labels and playlists are groups of songs. Selecting one
+highlights its songs and dims the rest; they never appear as nodes.
 
 **Layout ("harmonic map")**
-- Song angle = Camelot number (1–12). Minor keys (A) sit on the inner ring, major keys (B) on the
+- Angle = Camelot number (1–12). Minor keys (A) sit on the inner ring, major keys (B) on the
   outer ring, so compatible keys (±1, relative major/minor) are neighbours.
-- Song radius within its ring = BPM (log scale), plus collision jitter.
-- Artists, labels and playlists sit at the centroid of their visible songs and are pushed outward
-  by a light force simulation.
+- Radius within the ring = BPM (log scale), plus a small stable jitter. Songs without a key sit
+  in the middle.
+- Songs are *not* grouped by artist/label/playlist in space; position is purely musical.
 
-**Visibility.** Nothing is shown until a filter is active.
-- Filters (combine): search, "new" (added in the last N days), BPM range, key, genre, "not in any
-  playlist", plus the **Playlists** and **Labels** chips that show all nodes of that kind.
-- Click a **song**: show its artist, label and playlists, with edges.
-- Click an **artist**: show its songs.
-- Click a **label**: show its artists. Clicking one of those artists shows their songs, with the
-  label's songs highlighted.
-- Click a **playlist**: show its songs.
-- Expanded nodes stay until cleared. Pinning keeps a node across filter changes.
+**Selecting**
+- Click a song: it's highlighted, and the inspector lists its artist, label and playlists as links.
+- Artists ▾ / Labels ▾ / Playlists ▾ chips open a list; picking one highlights its songs.
+- A selected label lists its artists in the inspector (label → artist → songs).
+- A selected playlist also draws its route through the map in play order, numbered.
+- Filters (New, later search/BPM/key) limit which songs are shown; a selection's songs always show.
+- Esc closes the picker, then clears the selection.
 
-**Interaction**
-- Dragging a song reveals playlist drop targets around the canvas edge, plus "+ New playlist".
+**Interaction (planned)**
+- Drag a song onto a playlist (drop targets appear while dragging), plus "+ New playlist".
 - Box-select (shift-drag) for several songs.
 - Right-click: reveal in Finder, remove from playlist.
 

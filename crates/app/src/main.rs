@@ -14,7 +14,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, ScrollWheelEvent, SharedString,
     TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
-use map::{Frame, MapState};
+use map::{Frame, MapState, Picker};
 use theme::Theme;
 use trackmap_core::settings::Settings;
 use trackmap_core::{playlists, Library, Playlist, Watcher, PLAYLISTS_DIR};
@@ -304,24 +304,23 @@ impl Workspace {
                     cx.notify();
                 })),
             )
-            .child(
-                toggle("playlists", "Playlists".into(), self.map.show_playlists).on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.map.show_playlists = !this.map.show_playlists;
+            .children([
+                (Picker::Artists, "artists", "Artists"),
+                (Picker::Labels, "labels", "Labels"),
+                (Picker::Playlists, "playlists", "Playlists"),
+            ]
+            .map(|(kind, id, label)| {
+                toggle(id, format!("{label} ▾").into(), self.map.picker == Some(kind)).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.map.picker =
+                            if this.map.picker == Some(kind) { None } else { Some(kind) };
                         cx.notify();
                     }),
-                ),
-            )
-            .child(toggle("labels", "Labels".into(), self.map.show_labels).on_click(cx.listener(
-                |this, _, _, cx| {
-                    this.map.show_labels = !this.map.show_labels;
-                    cx.notify();
-                },
-            )))
-            .when(!self.map.expanded.is_empty(), |d| {
+                )
+            }))
+            .when(self.map.selected.is_some(), |d| {
                 d.child(toggle("clear", "Clear ✕".into(), false).on_click(cx.listener(
                     |this, _, _, cx| {
-                        this.map.expanded.clear();
                         this.map.selected = None;
                         cx.notify();
                     },
@@ -490,31 +489,13 @@ impl Workspace {
             return div().into_any_element();
         };
         let keys: Vec<_> = lib.tracks.iter().map(|tr| tr.key).collect();
-        let expanded: Vec<NodeId> =
-            self.map.expanded.iter().filter_map(|k| graph.find(k)).collect();
         let selected = self.map.selected.as_ref().and_then(|k| graph.find(k));
-        let visible = graph.visible(
-            self.visible.iter().copied(),
-            self.map.show_playlists,
-            self.map.show_labels,
-            &expanded,
-        );
-        let edges = graph.edges(&visible);
-        let frame = Frame::build(
-            &graph,
-            &keys,
-            &visible,
-            &edges,
-            selected,
-            self.map.hovered,
-            &self.map,
-            t,
-        );
-        let mut drawn: Vec<_> = visible.iter().map(|&n| (n, graph.position(n))).collect();
-        drawn.sort_by_key(|(n, _)| !matches!(n, NodeId::Song(_)));
+        let (frame, drawn) =
+            Frame::build(&graph, &keys, &self.visible, selected, self.map.hovered, &self.map, t);
         self.map.drawn = drawn;
+        let picker = self.map.picker.map(|kind| self.picker(kind, &graph, t, cx));
 
-        let songs = visible.iter().filter(|n| matches!(n, NodeId::Song(_))).count();
+        let songs = self.visible.len();
         let bounds_cell = self.map.bounds.clone();
         div()
             .id("map")
@@ -561,11 +542,14 @@ impl Workspace {
                         return;
                     }
                     match (this.map.hit(e.position), &this.graph) {
-                        (Some(n), Some(g)) => {
-                            let key = g.key(n);
+                        (Some(s), Some(g)) => {
+                            let key = g.key(NodeId::Song(s));
                             this.map.select(key);
                         }
-                        _ => this.map.selected = None,
+                        _ => {
+                            this.map.selected = None;
+                            this.map.picker = None;
+                        }
                     }
                     cx.notify();
                 }),
@@ -605,8 +589,65 @@ impl Workspace {
                     .left_3()
                     .text_xs()
                     .text_color(t.text_muted)
-                    .child("Click to expand  ·  drag or scroll to pan  ·  ⌘ + scroll to zoom  ·  Esc to deselect"),
+                    .child("Click a song  ·  drag or scroll to pan  ·  ⌘ + scroll to zoom  ·  Esc to deselect"),
             )
+            .children(picker)
+            .into_any_element()
+    }
+
+    /// List of artists, labels or playlists to pick from; picking one highlights its songs.
+    fn picker(&self, kind: Picker, graph: &Graph, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let t = *t;
+        let (names, make): (&[String], fn(usize) -> NodeId) = match kind {
+            Picker::Artists => (&graph.artists, NodeId::Artist),
+            Picker::Labels => (&graph.labels, NodeId::Label),
+            Picker::Playlists => (&graph.playlists, NodeId::Playlist),
+        };
+        let mut items: Vec<(String, NodeId, usize)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), make(i), graph.songs_of(make(i)).len()))
+            .collect();
+        items.sort_by_key(|(n, _, _)| n.to_lowercase());
+        let empty = items.is_empty();
+        div()
+            .id("picker")
+            .absolute()
+            .top_8()
+            .left_3()
+            .w(px(260.))
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .py_1()
+            .rounded_lg()
+            .bg(t.bg_elevated)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg()
+            // Clicks inside the list must not reach the map underneath.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(empty, |d| {
+                d.child(div().px_3().py_1().text_color(t.text_muted).child("None yet"))
+            })
+            .children(items.into_iter().enumerate().map(|(row, (name, node, count))| {
+                let key = graph.key(node);
+                div()
+                    .id(("pick", row))
+                    .flex()
+                    .justify_between()
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_color(t.text)
+                    .hover(|s| s.bg(t.bg_panel).text_color(t.accent))
+                    .child(name)
+                    .child(div().text_color(t.text_muted).child(count.to_string()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.map.select(key.clone());
+                        cx.notify();
+                    }))
+            }))
             .into_any_element()
     }
 
@@ -770,13 +811,13 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &OpenFolder, _, cx| this.open_folder(cx)))
             .on_action(cx.listener(|this, _: &Dismiss, _, cx| {
-                // Esc peels back one layer: palette, then selection, then expanded nodes.
+                // Esc peels back one layer: palette, then picker, then selection.
                 if this.palette.is_some() {
                     this.palette = None;
-                } else if this.map.selected.is_some() {
-                    this.map.selected = None;
+                } else if this.map.picker.is_some() {
+                    this.map.picker = None;
                 } else {
-                    this.map.expanded.clear();
+                    this.map.selected = None;
                 }
                 cx.notify();
             }))

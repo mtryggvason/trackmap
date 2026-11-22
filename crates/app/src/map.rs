@@ -1,4 +1,5 @@
-//! The graph canvas: pan/zoom state, painting and hit-testing.
+//! The song map: pan/zoom state, painting and hit-testing. Only songs are drawn; selecting an
+//! artist, label or playlist highlights its songs.
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -11,6 +12,14 @@ use gpui::{
 use trackmap_core::Camelot;
 use trackmap_graph::{Graph, HarmonicLayout, NodeId, NodeKey, Point as WorldPoint};
 
+/// Which list the Artists / Labels / Playlists chip has open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Picker {
+    Artists,
+    Labels,
+    Playlists,
+}
+
 use crate::theme::Theme;
 
 /// World radius that fits the screen at zoom 1 (outer edge of the major-key ring plus margin).
@@ -21,17 +30,17 @@ pub struct MapState {
     /// Screen-space offset of the world origin from the canvas centre.
     pub pan: Point<Pixels>,
     pub zoom: f32,
-    pub expanded: Vec<NodeKey>,
+    /// A song, or an artist/label/playlist whose songs are highlighted.
     pub selected: Option<NodeKey>,
-    pub hovered: Option<NodeId>,
+    /// Song index under the cursor.
+    pub hovered: Option<usize>,
     pub drag_from: Option<Point<Pixels>>,
     pub dragged: bool,
-    pub show_playlists: bool,
-    pub show_labels: bool,
+    pub picker: Option<Picker>,
     /// Canvas bounds from the last paint, for hit-testing mouse events.
     pub bounds: Rc<Cell<Bounds<Pixels>>>,
-    /// Nodes drawn last frame, in paint order.
-    pub drawn: Vec<(NodeId, WorldPoint)>,
+    /// Songs drawn last frame, in paint order.
+    pub drawn: Vec<(usize, WorldPoint)>,
 }
 
 impl Default for MapState {
@@ -39,13 +48,11 @@ impl Default for MapState {
         Self {
             pan: point(px(0.), px(0.)),
             zoom: 1.0,
-            expanded: Vec::new(),
             selected: None,
             hovered: None,
             drag_from: None,
             dragged: false,
-            show_playlists: false,
-            show_labels: false,
+            picker: None,
             bounds: Rc::new(Cell::new(Bounds::default())),
             drawn: Vec::new(),
         }
@@ -82,8 +89,8 @@ impl MapState {
         Transform::new(self.bounds.get(), self.pan, self.zoom)
     }
 
-    /// Topmost node under the cursor.
-    pub fn hit(&self, pos: Point<Pixels>) -> Option<NodeId> {
+    /// Topmost song under the cursor.
+    pub fn hit(&self, pos: Point<Pixels>) -> Option<usize> {
         let tf = self.transform();
         self.drawn
             .iter()
@@ -109,10 +116,8 @@ impl MapState {
     }
 
     pub fn select(&mut self, key: NodeKey) {
-        if !self.expanded.contains(&key) {
-            self.expanded.push(key.clone());
-        }
         self.selected = Some(key);
+        self.picker = None;
     }
 }
 
@@ -120,114 +125,98 @@ pub fn key_color(k: Camelot) -> Hsla {
     hsla((k.number - 1) as f32 / 12.0, 0.65, 0.6, 1.0)
 }
 
-struct DrawNode {
-    id: NodeId,
+struct DrawSong {
     pos: WorldPoint,
     fill: Hsla,
-    border: Hsla,
+    ring: Hsla,
+    big: bool,
     label: Option<SharedString>,
     label_color: Hsla,
 }
 
 /// Everything needed to paint one frame, owned so it can move into the canvas closure.
 pub struct Frame {
-    nodes: Vec<DrawNode>,
-    edges: Vec<(WorldPoint, WorldPoint)>,
-    edges_hi: Vec<(WorldPoint, WorldPoint)>,
+    songs: Vec<DrawSong>,
+    /// A selected playlist's songs in play order.
+    route: Vec<WorldPoint>,
     pan: Point<Pixels>,
     zoom: f32,
     theme: Theme,
 }
 
 impl Frame {
+    /// `shown` are the songs passing the filters. A selection's songs are always shown.
+    /// Returns the frame and the songs drawn, in paint order, for hit-testing.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         graph: &Graph,
         keys: &[Option<Camelot>],
-        visible: &[NodeId],
-        edges: &[(NodeId, NodeId)],
+        shown: &[usize],
         selected: Option<NodeId>,
-        hovered: Option<NodeId>,
+        hovered: Option<usize>,
         state: &MapState,
         theme: &Theme,
-    ) -> Self {
+    ) -> (Self, Vec<(usize, WorldPoint)>) {
         let accent: Hsla = theme.accent.into();
         let text: Hsla = theme.text.into();
         let muted: Hsla = theme.text_muted.into();
 
-        let focus: HashSet<NodeId> = match selected {
-            Some(s) => std::iter::once(s).chain(graph.neighbours(s)).collect(),
-            None => HashSet::new(),
-        };
-        let dim = |n: NodeId, c: Hsla| {
-            if selected.is_some() && !focus.contains(&n) { c.opacity(0.25) } else { c }
-        };
+        let focus_list = selected.map(|n| graph.songs_of(n)).unwrap_or_default();
+        let focus: HashSet<usize> = focus_list.iter().copied().collect();
+        let has_focus = selected.is_some();
 
-        let songs_shown = visible.iter().filter(|n| matches!(n, NodeId::Song(_))).count();
-        // Song titles get busy; show them when zoomed in on a modest number of songs.
-        let song_labels = state.zoom >= 3.0 && songs_shown <= 600 || songs_shown <= 40;
+        // Focused songs are painted last so they sit on top of dimmed ones.
+        let mut order: Vec<usize> = shown.iter().copied().filter(|s| !focus.contains(s)).collect();
+        order.extend(focus_list.iter().copied());
 
-        // Paint songs first so group nodes sit on top.
-        let mut order: Vec<NodeId> = visible.to_vec();
-        order.sort_by_key(|n| !matches!(n, NodeId::Song(_)));
+        let crowded = shown.len() > 40;
+        let song_labels_zoomed = state.zoom >= 3.0 && shown.len() <= 600;
+        let label_focus = focus.len() <= 60;
 
-        let nodes = order
-            .into_iter()
-            .map(|n| {
-                let is_sel = Some(n) == selected;
-                let is_hover = Some(n) == hovered;
-                let (fill, border) = match n {
-                    NodeId::Song(i) => {
-                        let ring = keys[i].map(key_color).unwrap_or(muted);
-                        (if is_sel { accent } else { hsla(0., 0., 0.55, 1.) }, ring)
-                    }
-                    NodeId::Artist(_) => (if is_sel { accent } else { hsla(0., 0., 0.85, 1.) }, text),
-                    NodeId::Label(_) => (if is_sel { accent } else { hsla(0., 0., 0.4, 1.) }, text),
-                    NodeId::Playlist(_) => {
-                        (if is_sel { accent } else { theme.bg_elevated.into() }, accent)
-                    }
+        let mut drawn = Vec::with_capacity(order.len());
+        let songs = order
+            .iter()
+            .map(|&s| {
+                let pos = graph.song_position(s);
+                drawn.push((s, pos));
+                let in_focus = focus.contains(&s);
+                let is_hover = hovered == Some(s);
+                let ring = keys[s].map(key_color).unwrap_or(muted);
+                let (fill, ring) = match (has_focus, in_focus) {
+                    (true, true) => (accent, ring),
+                    (true, false) => (hsla(0., 0., 0.55, 0.2), ring.opacity(0.2)),
+                    _ => (hsla(0., 0., 0.55, 1.), ring),
                 };
-                let labelled = !matches!(n, NodeId::Song(_))
-                    || song_labels
-                    || is_sel
-                    || is_hover
-                    || (selected.is_some() && focus.contains(&n));
-                DrawNode {
-                    id: n,
-                    pos: graph.position(n),
-                    fill: dim(n, fill),
-                    border: dim(n, border),
-                    label: labelled.then(|| SharedString::from(graph.name(n).to_string())),
-                    label_color: dim(n, if is_sel || is_hover { text } else { muted }),
+                let labelled =
+                    is_hover || (in_focus && label_focus) || !crowded || song_labels_zoomed;
+                DrawSong {
+                    pos,
+                    fill,
+                    ring,
+                    big: is_hover || (in_focus && focus.len() == 1),
+                    label: labelled.then(|| SharedString::from(graph.song_titles[s].clone())),
+                    label_color: if is_hover || in_focus {
+                        text
+                    } else if has_focus {
+                        muted.opacity(0.3)
+                    } else {
+                        muted
+                    },
                 }
             })
             .collect();
 
-        let mut lines = Vec::new();
-        let mut lines_hi = Vec::new();
-        for &(a, b) in edges {
-            let seg = (graph.position(a), graph.position(b));
-            if selected.is_some_and(|s| s == a || s == b) {
-                lines_hi.push(seg);
-            } else {
-                lines.push(seg);
-            }
-        }
+        let route = match selected {
+            Some(NodeId::Playlist(_)) => focus_list.iter().map(|&s| graph.song_position(s)).collect(),
+            _ => Vec::new(),
+        };
 
-        Self {
-            nodes,
-            edges: lines,
-            edges_hi: lines_hi,
-            pan: state.pan,
-            zoom: state.zoom,
-            theme: *theme,
-        }
+        (Self { songs, route, pan: state.pan, zoom: state.zoom, theme: *theme }, drawn)
     }
 
     pub fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
         let tf = Transform::new(bounds, self.pan, self.zoom);
         let t = &self.theme;
-        let muted: Hsla = t.text_muted.into();
         let font = window.text_style().font();
 
         // Key wheel guides: ring boundaries and key names.
@@ -236,8 +225,8 @@ impl Frame {
         let major_in = minor_out + layout.gap;
         let major_out = major_in + layout.ring_width;
         let guide: Hsla = Hsla::from(t.border).opacity(0.8);
+        let c = tf.to_screen(WorldPoint { x: 0., y: 0. });
         for r in [layout.inner, minor_out, major_in, major_out] {
-            let c = tf.to_screen(WorldPoint { x: 0., y: 0. });
             let rs = px(r * tf.scale);
             window.paint_quad(quad(
                 Bounds::new(point(c.x - rs, c.y - rs), size(rs * 2., rs * 2.)),
@@ -257,41 +246,39 @@ impl Frame {
             }
         }
 
-        for (segs, color) in [(&self.edges, muted.opacity(0.35)), (&self.edges_hi, t.accent.into())] {
-            if segs.is_empty() {
-                continue;
-            }
-            let mut path = PathBuilder::stroke(px(1.));
-            for (a, b) in segs.iter() {
-                path.move_to(tf.to_screen(*a));
-                path.line_to(tf.to_screen(*b));
+        // A selected playlist's route, in play order.
+        if self.route.len() > 1 {
+            let mut path = PathBuilder::stroke(px(1.5));
+            path.move_to(tf.to_screen(self.route[0]));
+            for p in &self.route[1..] {
+                path.line_to(tf.to_screen(*p));
             }
             if let Ok(p) = path.build() {
-                window.paint_path(p, color);
+                window.paint_path(p, Hsla::from(t.accent).opacity(0.6));
             }
         }
 
-        for n in &self.nodes {
-            let c = tf.to_screen(n.pos);
-            let (w, h, radius, border) = match n.id {
-                NodeId::Song(_) => (9., 9., 4.5, 1.5),
-                NodeId::Artist(_) => (14., 14., 7., 1.),
-                NodeId::Label(_) => (14., 14., 3., 1.),
-                NodeId::Playlist(_) => (20., 13., 4., 1.5),
-            };
-            let (w, h) = (px(w), px(h));
+        for s in &self.songs {
+            let c = tf.to_screen(s.pos);
+            let d = px(if s.big { 13. } else { 9. });
             window.paint_quad(quad(
-                Bounds::new(point(c.x - w / 2., c.y - h / 2.), size(w, h)),
-                px(radius),
-                n.fill,
-                px(border),
-                n.border,
+                Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d)),
+                d / 2.,
+                s.fill,
+                px(1.5),
+                s.ring,
                 BorderStyle::Solid,
             ));
-            if let Some(label) = &n.label {
-                let at = point(c.x + w / 2. + px(5.), c.y);
-                paint_text(window, cx, &font, label, 12., n.label_color, at, false);
+            if let Some(label) = &s.label {
+                let at = point(c.x + d / 2. + px(5.), c.y);
+                paint_text(window, cx, &font, label, 12., s.label_color, at, false);
             }
+        }
+
+        // Play-order numbers on top of the route.
+        for (i, p) in self.route.iter().enumerate() {
+            let c = tf.to_screen(*p);
+            paint_text(window, cx, &font, &(i + 1).to_string(), 10., t.bg_app.into(), c, true);
         }
     }
 }
@@ -350,12 +337,9 @@ mod tests {
         let mut s = MapState::default();
         s.bounds.set(Bounds::new(point(px(0.), px(0.)), size(px(920.), px(920.))));
         // scale = 460 / 920 = 0.5, centre = (460, 460)
-        s.drawn = vec![
-            (NodeId::Song(0), WorldPoint { x: 0., y: 0. }),
-            (NodeId::Song(1), WorldPoint { x: 30., y: 0. }),
-        ];
-        assert_eq!(s.hit(point(px(462.), px(460.))), Some(NodeId::Song(0)));
-        assert_eq!(s.hit(point(px(474.), px(460.))), Some(NodeId::Song(1)));
+        s.drawn = vec![(0, WorldPoint { x: 0., y: 0. }), (1, WorldPoint { x: 30., y: 0. })];
+        assert_eq!(s.hit(point(px(462.), px(460.))), Some(0));
+        assert_eq!(s.hit(point(px(474.), px(460.))), Some(1));
         assert_eq!(s.hit(point(px(600.), px(600.))), None);
     }
 }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use trackmap_core::{Camelot, Playlist, Track};
 
-use crate::{MapLayout, Point};
+use crate::{Columns, MapLayout, Point};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
@@ -164,6 +164,11 @@ impl Graph {
         v.to_vec()
     }
 
+    /// A song's tempo (tag or detected).
+    pub fn tempo(&self, song: usize) -> Option<f32> {
+        self.song_tempo[song]
+    }
+
     pub fn song_count(&self) -> usize {
         self.song_titles.len()
     }
@@ -186,8 +191,11 @@ impl Graph {
     /// Every song's position in `layout` with tempo grouped into bins of `bin` BPM: x is the
     /// bin, y the key row, and songs sharing a cell are spread evenly across it (by artist,
     /// then title).
-    pub fn positions(&self, layout: &MapLayout, bin: f32) -> Vec<Point> {
+    /// With `columns`, x is the song's flattened tempo column instead of its place on the
+    /// true scale (and `bin` is ignored).
+    pub fn positions(&self, layout: &MapLayout, bin: f32, columns: Option<&Columns>) -> Vec<Point> {
         let l = layout;
+        let bin = if columns.is_some() { 0.1 } else { bin };
         let mut cells: BTreeMap<(i64, usize), Vec<usize>> = BTreeMap::new();
         for s in 0..self.song_count() {
             let col = match self.song_tempo[s].filter(|b| b.is_finite() && *b > 0.0) {
@@ -200,7 +208,12 @@ impl Graph {
         for ((_, row), mut members) in cells {
             members.sort_by_key(|&s| self.song_rank[s]);
             let n = members.len();
-            let (cx, width) = l.cell_x(self.song_tempo[members[0]], bin);
+            let tempo = self.song_tempo[members[0]].filter(|b| b.is_finite() && *b > 0.0);
+            let (cx, width) = match (columns, tempo) {
+                (Some(c), Some(b)) => (c.x(b), c.gap),
+                (Some(c), None) => (c.no_bpm_x(), c.gap.min(120.0)),
+                (None, _) => l.cell_x(tempo, bin),
+            };
             // Use up to 80% of the cell so neighbouring cells stay apart.
             let gap = if n > 1 { width * 0.8 / (n - 1) as f32 } else { 0.0 };
             for (i, &s) in members.iter().enumerate() {
@@ -321,7 +334,7 @@ mod tests {
         let g = Graph::build(&tracks, &[]);
 
         // Whole-BPM bins: Zed and Ann share the 124/8A cell, side by side, Ann first.
-        let p = g.positions(&g.layout, 1.0);
+        let p = g.positions(&g.layout, 1.0, None);
         assert_eq!(p[0].y, p[1].y);
         assert!(p[1].x < p[0].x, "Ann before Zed");
         let centre = g.layout.bpm_x(124.0);
@@ -332,11 +345,17 @@ mod tests {
         assert_eq!(p[3].y, g.layout.row_y(crate::KEY_ROWS - 1));
 
         // Zoomed in to 0.1 BPM bins, 124.0 and 124.3 separate and each sits at its own BPM.
-        let p = g.positions(&g.layout, 0.1);
+        let p = g.positions(&g.layout, 0.1, None);
         assert!((p[0].x - g.layout.bpm_x(124.0)).abs() < 1e-3);
         assert!((p[1].x - g.layout.bpm_x(124.3)).abs() < 1e-2);
 
         // Fitted to Zed and Bob only: one tempo, two keys, so just two rows.
+        // Flattened: Ann (124.3) and Zed/Bob (124.0) get neighbouring columns.
+        let cols = Columns::new([124.0, 124.3], g.layout.half_width).unwrap();
+        let p = g.positions(&g.layout, 1.0, Some(&cols));
+        assert_eq!((p[0].x, p[1].x), (cols.xs[0], cols.xs[1]));
+        assert_eq!(p[3].x, cols.no_bpm_x());
+
         let sub = g.layout_for(&[0, 2]);
         assert_eq!(sub.rows(), [14, 16]);
         assert!(sub.bpm_min <= 124.0 && sub.bpm_max >= 124.0);

@@ -24,7 +24,7 @@ use trackmap_core::{
     artwork, key_detect, playlists, tags, tempo, Art, Camelot, Library, Playlist, Watcher,
     PLAYLISTS_DIR,
 };
-use trackmap_graph::{Graph, NodeId};
+use trackmap_graph::{Columns, Graph, NodeId};
 
 actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
 
@@ -927,9 +927,18 @@ impl Workspace {
         // library's layout.
         let subset = shown.len() < graph.song_count();
         let layout = if subset && !shown.is_empty() { graph.layout_for(&shown) } else { graph.layout };
-        // Tempo bins get finer as you zoom in, so a bin is always about a cover wide on screen.
-        let bin = layout
-            .bin_for(self.map.transform().scale(), (map::cover_size(self.map.zoom) * 1.3).max(14.0));
+        // A subset with few distinct tempos gets a flattened axis: one column per tempo.
+        let columns = if subset {
+            Columns::new(shown.iter().filter_map(|&s| graph.tempo(s)), layout.half_width)
+        } else {
+            None
+        };
+        // Otherwise tempo bins get finer as you zoom in, so a bin is about a cover wide on screen.
+        let bin = if columns.is_some() {
+            0.1
+        } else {
+            layout.bin_for(self.map.transform().scale(), (map::cover_size(self.map.zoom) * 1.3).max(14.0))
+        };
         let signature = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -941,7 +950,7 @@ impl Workspace {
                 p.clone()
             }
             _ => {
-                let p = Rc::new(graph.positions(&layout, bin));
+                let p = Rc::new(graph.positions(&layout, bin, columns.as_ref()));
                 self.map.positions = Some((bin, graph.clone(), signature, p.clone()));
                 p
             }
@@ -949,9 +958,12 @@ impl Workspace {
         // Highlighting only applies to a song picked inside the view, not to the group itself.
         let highlight = selected.filter(|_| self.map.selected != self.map.scope);
         let route_of = selected.filter(|n| matches!(n, NodeId::Playlist(_))).or(scope);
+        let has_no_bpm = shown.iter().any(|&s| graph.tempo(s).is_none());
         let (frame, drawn) = Frame::build(
             &graph,
             layout,
+            columns,
+            has_no_bpm,
             &positions,
             &keys,
             &arts,

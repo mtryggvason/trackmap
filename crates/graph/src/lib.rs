@@ -3,6 +3,7 @@
 mod model;
 
 pub use model::{Graph, NodeId, NodeKey};
+
 use trackmap_core::Camelot;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,6 +50,58 @@ pub const BINS: [f32; 7] = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0];
 
 /// World width given to the no-BPM column.
 const NO_BPM_WIDTH: f32 = 60.0;
+
+/// A flattened BPM axis has at most this many columns; more fall back to the true scale.
+pub const MAX_COLUMNS: usize = 40;
+/// Gap between flattened columns, at most (so two columns don't sit at the far edges).
+const MAX_COLUMN_GAP: f32 = 260.0;
+
+/// A flattened ("ordinal") BPM axis: one evenly spaced column per distinct tempo, in order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Columns {
+    /// Distinct tempos (to 0.1 BPM), ascending.
+    pub bpms: Vec<f32>,
+    /// World x of each column.
+    pub xs: Vec<f32>,
+    /// Distance between neighbouring columns.
+    pub gap: f32,
+}
+
+impl Columns {
+    /// Columns for these tempos, or `None` if there are too many to flatten.
+    pub fn new(tempos: impl IntoIterator<Item = f32>, half_width: f32) -> Option<Self> {
+        let mut bpms: Vec<f32> = tempos
+            .into_iter()
+            .filter(|b| b.is_finite() && *b > 0.0)
+            .map(|b| (b * 10.0).round() / 10.0)
+            .collect();
+        bpms.sort_by(f32::total_cmp);
+        bpms.dedup();
+        if bpms.is_empty() || bpms.len() > MAX_COLUMNS {
+            return None;
+        }
+        let n = bpms.len();
+        let gap = if n > 1 { (2.0 * half_width / (n - 1) as f32).min(MAX_COLUMN_GAP) } else { MAX_COLUMN_GAP };
+        let start = -gap * (n as f32 - 1.0) / 2.0;
+        let xs = (0..n).map(|i| start + i as f32 * gap).collect();
+        Some(Self { bpms, xs, gap })
+    }
+
+    /// Column x for a tempo (nearest column).
+    pub fn x(&self, bpm: f32) -> f32 {
+        let v = (bpm * 10.0).round() / 10.0;
+        let i = match self.bpms.binary_search_by(|b| b.total_cmp(&v)) {
+            Ok(i) => i,
+            Err(i) => i.min(self.bpms.len() - 1),
+        };
+        self.xs[i]
+    }
+
+    /// x of the column for songs with no BPM: one gap left of the first column.
+    pub fn no_bpm_x(&self) -> f32 {
+        self.xs[0] - self.gap.max(120.0)
+    }
+}
 
 impl Default for MapLayout {
     fn default() -> Self {
@@ -194,6 +247,22 @@ impl MapLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flattened_columns_show_only_tempos_present() {
+        let c = Columns::new([135.0, 120.0, 123.0, 123.04], 900.0).unwrap();
+        assert_eq!(c.bpms, [120.0, 123.0, 135.0]);
+        // Evenly spaced and centred, whatever the BPM differences.
+        assert!((c.xs[1] - c.xs[0] - (c.xs[2] - c.xs[1])).abs() < 1e-3);
+        assert!((c.xs[0] + c.xs[2]).abs() < 1e-3);
+        assert_eq!(c.x(123.0), c.xs[1]);
+        assert!(c.no_bpm_x() < c.xs[0]);
+        // Two columns stay reasonably close instead of at the far edges.
+        let two = Columns::new([120.0, 128.0], 900.0).unwrap();
+        assert_eq!(two.gap, MAX_COLUMN_GAP);
+        assert!(Columns::new((0..60).map(|i| 100.0 + i as f32), 900.0).is_none());
+        assert!(Columns::new([], 900.0).is_none());
+    }
 
     #[test]
     fn zooming_in_picks_finer_bins() {

@@ -11,7 +11,7 @@ use gpui::{
     Pixels, Point, RenderImage, SharedString, TextRun, Window,
 };
 use trackmap_core::Camelot;
-use trackmap_graph::{Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint, KEY_ROWS};
+use trackmap_graph::{Columns, Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint, KEY_ROWS};
 
 /// Which list the Artists / Labels / Playlists chip has open.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,6 +202,9 @@ pub struct Frame {
     /// A selected playlist's songs in play order.
     route: Vec<WorldPoint>,
     layout: MapLayout,
+    /// Flattened BPM axis, if this view uses one.
+    columns: Option<Columns>,
+    has_no_bpm: bool,
     pan: Point<Pixels>,
     zoom: f32,
     theme: Theme,
@@ -214,6 +217,8 @@ impl Frame {
     pub fn build(
         graph: &Graph,
         layout: MapLayout,
+        columns: Option<Columns>,
+        has_no_bpm: bool,
         positions: &[WorldPoint],
         keys: &[Option<Camelot>],
         arts: &[Option<Arc<RenderImage>>],
@@ -288,7 +293,7 @@ impl Frame {
             _ => Vec::new(),
         };
 
-        (Self { songs, route, layout, pan: state.pan, zoom: state.zoom, theme: *theme }, drawn)
+        (Self { songs, route, layout, columns, has_no_bpm, pan: state.pan, zoom: state.zoom, theme: *theme }, drawn)
     }
 
     pub fn paint(self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
@@ -380,19 +385,36 @@ impl Frame {
 
         // Axes, pinned to the canvas edges so they stay visible while zooming and panning:
         // BPM along the bottom (finer steps as you zoom in), keys down the left.
-        let left = tf.to_world(bounds.origin).x;
-        let right = tf.to_world(point(bounds.origin.x + bounds.size.width, bounds.origin.y)).x;
-        let (step, ticks) = l.bpm_ticks(l.x_bpm(left), l.x_bpm(right), tf.scale(), 56.0);
         let axis_y = bounds.origin.y + bounds.size.height - px(28.);
         let strip = Bounds::new(point(bounds.origin.x, axis_y - px(10.)), size(bounds.size.width, px(20.)));
         window.paint_quad(quad(strip, px(0.), bg.opacity(0.85), px(0.), bg, BorderStyle::Solid));
-        for bpm in ticks {
-            let x = tf.to_screen(WorldPoint { x: l.bpm_x(bpm), y: 0. }).x;
-            let text = if step < 1.0 { format!("{bpm:.1}") } else { format!("{bpm:.0}") };
-            paint_text(window, cx, &font, &text, 11., muted, point(x, axis_y), true);
-        }
-        let no_bpm = tf.to_screen(WorldPoint { x: l.no_bpm_x(), y: 0. }).x;
-        if no_bpm > bounds.origin.x {
+        let fmt = |bpm: f32, fine: bool| if fine || bpm.fract() != 0.0 { format!("{bpm:.1}") } else { format!("{bpm:.0}") };
+        let no_bpm_world = match &self.columns {
+            Some(c) => {
+                // Flattened: label exactly the tempos present, skipping any that would collide.
+                let mut last = f32::MIN;
+                for (bpm, x) in c.bpms.iter().zip(&c.xs) {
+                    let sx = tf.to_screen(WorldPoint { x: *x, y: 0. }).x;
+                    if f32::from(sx) - last >= 36.0 {
+                        paint_text(window, cx, &font, &fmt(*bpm, false), 11., muted, point(sx, axis_y), true);
+                        last = f32::from(sx);
+                    }
+                }
+                c.no_bpm_x()
+            }
+            None => {
+                let left = tf.to_world(bounds.origin).x;
+                let right = tf.to_world(point(bounds.origin.x + bounds.size.width, bounds.origin.y)).x;
+                let (step, ticks) = l.bpm_ticks(l.x_bpm(left), l.x_bpm(right), tf.scale(), 56.0);
+                for bpm in ticks {
+                    let x = tf.to_screen(WorldPoint { x: l.bpm_x(bpm), y: 0. }).x;
+                    paint_text(window, cx, &font, &fmt(bpm, step < 1.0), 11., muted, point(x, axis_y), true);
+                }
+                l.no_bpm_x()
+            }
+        };
+        let no_bpm = tf.to_screen(WorldPoint { x: no_bpm_world, y: 0. }).x;
+        if self.has_no_bpm && no_bpm > bounds.origin.x {
             paint_text(window, cx, &font, "no BPM", 11., muted.opacity(0.6), point(no_bpm, axis_y), true);
         }
         let key_x = bounds.origin.x + px(22.);

@@ -1,7 +1,8 @@
 mod map;
 mod theme;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -10,14 +11,15 @@ use futures::StreamExt;
 
 use gpui::{
     actions, canvas, div, point, prelude::*, px, size, uniform_list, AnyElement, App,
-    Application, Bounds, Context, FocusHandle, KeyBinding, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathPromptOptions, ScrollWheelEvent, SharedString,
+    Bounds, Context, FocusHandle, KeyBinding, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathPromptOptions, PinchEvent, RenderImage, ScrollEvent,
+    SharedString,
     TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use map::{Frame, MapState, Picker};
 use theme::Theme;
 use trackmap_core::settings::Settings;
-use trackmap_core::{playlists, Library, Playlist, Watcher, PLAYLISTS_DIR};
+use trackmap_core::{artwork, playlists, Art, Library, Playlist, Watcher, PLAYLISTS_DIR};
 use trackmap_graph::{Graph, NodeId};
 
 actions!(trackmap, [QuickOpen, CommandPalette, OpenFolder, Dismiss, Quit]);
@@ -57,6 +59,21 @@ struct Workspace {
     graph: Option<Rc<Graph>>,
     map: MapState,
     view: ViewMode,
+    /// Decoded cover thumbnails by file name.
+    art_images: HashMap<String, Arc<RenderImage>>,
+    art_running: bool,
+}
+
+/// Covers looked up per background step, so they appear progressively.
+const ART_BATCH: usize = 24;
+
+/// Decodes a thumbnail into the BGRA frame GPUI draws.
+fn decode_thumb(path: &std::path::Path) -> Option<Arc<RenderImage>> {
+    let mut rgba = image::open(path).ok()?.to_rgba8();
+    for px in rgba.pixels_mut() {
+        px.0.swap(0, 2);
+    }
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -78,7 +95,113 @@ impl Workspace {
             graph: None,
             map: MapState::default(),
             view: ViewMode::Map,
+            art_images: HashMap::new(),
+            art_running: false,
         }
+    }
+
+    /// Finds covers for tracks not checked yet and decodes thumbnails not loaded yet, in
+    /// batches on a background thread. Safe to call often; only one pass runs at a time.
+    fn fill_artwork(&mut self, cx: &mut Context<Self>) {
+        if self.art_running {
+            return;
+        }
+        let LibraryState::Loaded(lib) = &self.library else { return };
+        self.art_running = true;
+        let root = lib.root.clone();
+        let generation = self.generation;
+
+        cx.spawn(async move |this, cx| {
+            let mut changed = false;
+            loop {
+                // What's left: tracks to look up, and thumbnails not decoded yet.
+                let Ok(Some((todo, missing))) = this.update(cx, |ws, _| {
+                    if ws.generation != generation {
+                        return None;
+                    }
+                    let LibraryState::Loaded(lib) = &ws.library else { return None };
+                    let mut todo = artwork::unchecked(&lib.tracks);
+                    todo.truncate(ART_BATCH);
+                    let missing: HashSet<String> = lib
+                        .tracks
+                        .iter()
+                        .filter_map(|t| match &t.art {
+                            Art::File(n) if !ws.art_images.contains_key(n) => Some(n.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    Some((todo, missing))
+                }) else {
+                    break;
+                };
+                if todo.is_empty() && missing.is_empty() {
+                    break;
+                }
+
+                let art_root = root.clone();
+                let (results, images) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let results = artwork::fill(&art_root, &todo);
+                        let dir = artwork::art_dir(&art_root);
+                        let mut names = missing;
+                        names.extend(results.iter().filter_map(|(_, a)| match a {
+                            Art::File(n) => Some(n.clone()),
+                            _ => None,
+                        }));
+                        let images: Vec<(String, Option<Arc<RenderImage>>)> = names
+                            .into_iter()
+                            .map(|n| {
+                                let img = decode_thumb(&dir.join(&n));
+                                (n, img)
+                            })
+                            .collect();
+                        (results, images)
+                    })
+                    .await;
+                changed |= !results.is_empty();
+
+                let ok = this.update(cx, |ws, cx| {
+                    if ws.generation != generation {
+                        return false;
+                    }
+                    let LibraryState::Loaded(lib) = &mut ws.library else { return false };
+                    // A thumbnail that can't be decoded counts as no art, so it isn't retried forever.
+                    let broken: HashSet<String> =
+                        images.iter().filter(|(_, i)| i.is_none()).map(|(n, _)| n.clone()).collect();
+                    lib.set_art(results);
+                    for t in &mut lib.tracks {
+                        if matches!(&t.art, Art::File(n) if broken.contains(n)) {
+                            t.art = Art::None;
+                        }
+                    }
+                    ws.art_images.extend(images.into_iter().filter_map(|(n, i)| Some((n, i?))));
+                    cx.notify();
+                    true
+                });
+                if !matches!(ok, Ok(true)) {
+                    break;
+                }
+            }
+
+            let snapshot = this.update(cx, |ws, _| {
+                ws.art_running = false;
+                match &ws.library {
+                    LibraryState::Loaded(lib) if changed && ws.generation == generation => {
+                        Some(lib.clone())
+                    }
+                    _ => None,
+                }
+            });
+            if let Ok(Some(lib)) = snapshot {
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = trackmap_core::cache::save(&lib);
+                    })
+                    .await;
+            }
+        })
+        .detach();
     }
 
     /// Rebuilds the graph after the library or playlists change.
@@ -113,6 +236,8 @@ impl Workspace {
         self.playlists.clear();
         self.graph = None;
         self.map = MapState::default();
+        self.art_images.clear();
+        self.art_running = false;
         self.library = LibraryState::Scanning(root.clone());
         cx.notify();
 
@@ -139,6 +264,7 @@ impl Workspace {
                         ws.playlists = pls;
                         ws.rebuild_graph();
                         ws.start_watching(generation, cx);
+                        ws.fill_artwork(cx);
                     }
                     Err(e) => ws.library = LibraryState::Failed(root, e.to_string()),
                 }
@@ -199,6 +325,7 @@ impl Workspace {
                         ws.playlists = pls;
                     }
                     ws.rebuild_graph();
+                    ws.fill_artwork(cx);
                     cx.notify();
                     Ok(snapshot)
                 });
@@ -485,9 +612,25 @@ impl Workspace {
             return div().into_any_element();
         };
         let keys: Vec<_> = lib.tracks.iter().map(|tr| tr.key).collect();
+        let arts: Vec<_> = lib
+            .tracks
+            .iter()
+            .map(|tr| match &tr.art {
+                Art::File(n) => self.art_images.get(n).cloned(),
+                _ => None,
+            })
+            .collect();
         let selected = self.map.selected.as_ref().and_then(|k| graph.find(k));
-        let (frame, drawn) =
-            Frame::build(&graph, &keys, &self.visible, selected, self.map.hovered, &self.map, t);
+        let (frame, drawn) = Frame::build(
+            &graph,
+            &keys,
+            &arts,
+            &self.visible,
+            selected,
+            self.map.hovered,
+            &self.map,
+            t,
+        );
         self.map.drawn = drawn;
         let picker = self.map.picker.map(|kind| self.picker(kind, &graph, t, cx));
 
@@ -550,7 +693,11 @@ impl Workspace {
                     cx.notify();
                 }),
             )
-            .on_scroll_wheel(cx.listener(|this, e: &ScrollWheelEvent, _, cx| {
+            .on_pinch(cx.listener(|this, e: &PinchEvent, _, cx| {
+                this.map.zoom_at(e.position, (1.0 + e.delta).clamp(0.5, 2.0));
+                cx.notify();
+            }))
+            .on_scroll(cx.listener(|this, e: &ScrollEvent, _, cx| {
                 let d = e.delta.pixel_delta(px(16.));
                 if e.modifiers.platform || e.modifiers.control {
                     let factor = (1.0 - f32::from(d.y) * 0.005).clamp(0.5, 2.0);
@@ -585,7 +732,7 @@ impl Workspace {
                     .left_3()
                     .text_xs()
                     .text_color(t.text_muted)
-                    .child("Click a song  ·  drag or scroll to pan  ·  ⌘ + scroll to zoom  ·  Esc to deselect"),
+                    .child("Click a song  ·  drag or scroll to pan  ·  pinch or ⌘ + scroll to zoom  ·  Esc to deselect"),
             )
             .children(picker)
             .into_any_element()
@@ -840,7 +987,7 @@ fn remember_library(root: &std::path::Path) {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    gpui_platform::application().run(|cx: &mut App| {
         cx.set_global(Theme::dark());
         cx.bind_keys([
             KeyBinding::new("cmd-p", QuickOpen, None),
@@ -881,7 +1028,7 @@ fn main() {
             .expect("failed to open window");
 
         window
-            .update(cx, |ws, window, _| window.focus(&ws.focus))
+            .update(cx, |ws, window, cx| window.focus(&ws.focus, cx))
             .expect("failed to focus window");
         cx.activate(true);
     });

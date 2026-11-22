@@ -8,5 +8,7 @@ license.workspace = true
 dirs = "7.0.0"
 futures = "0.3.34"
 gpui.workspace = true
+gpui_platform.workspace = true
+image = { version = "0.25.1", default-features = false, features = ["jpeg", "png"] }
 trackmap-core.workspace = true
 trackmap-graph.workspace = true

@@ -4,10 +4,11 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    hsla, point, px, quad, size, App, BorderStyle, Bounds, Hsla, PathBuilder,
-    Pixels, Point, SharedString, TextRun, Window,
+    hsla, point, px, quad, size, transparent_black, App, BorderStyle, Bounds, Hsla, PathBuilder,
+    Pixels, Point, RenderImage, SharedString, TextRun, Window,
 };
 use trackmap_core::Camelot;
 use trackmap_graph::{Graph, MapLayout, NodeId, NodeKey, Point as WorldPoint};
@@ -27,6 +28,11 @@ use crate::theme::Theme;
 const WORLD_HALF_W: f32 = 1060.0;
 const WORLD_HALF_H: f32 = 580.0;
 const HIT_RADIUS: f32 = 10.0;
+
+/// On-screen edge length of a cover at this zoom: grows gently as you zoom in.
+pub fn cover_size(zoom: f32) -> f32 {
+    (16.0 * zoom.sqrt()).clamp(14.0, 72.0)
+}
 
 pub struct MapState {
     /// Screen-space offset of the world origin from the canvas centre.
@@ -103,7 +109,10 @@ impl MapState {
                 let (dx, dy) = (f32::from(s.x - pos.x), f32::from(s.y - pos.y));
                 (n, dx * dx + dy * dy)
             })
-            .filter(|&(_, d2)| d2 <= HIT_RADIUS * HIT_RADIUS)
+            .filter(|&(_, d2)| {
+                let r = HIT_RADIUS.max(cover_size(self.zoom) / 2.0);
+                d2 <= r * r
+            })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(n, _)| n)
     }
@@ -130,6 +139,8 @@ pub fn key_color(k: Camelot) -> Hsla {
 
 struct DrawSong {
     pos: WorldPoint,
+    art: Option<Arc<RenderImage>>,
+    dimmed: bool,
     fill: Hsla,
     ring: Hsla,
     big: bool,
@@ -155,6 +166,7 @@ impl Frame {
     pub fn build(
         graph: &Graph,
         keys: &[Option<Camelot>],
+        arts: &[Option<Arc<RenderImage>>],
         shown: &[usize],
         selected: Option<NodeId>,
         hovered: Option<usize>,
@@ -195,6 +207,8 @@ impl Frame {
                     is_hover || (in_focus && label_focus) || !crowded || song_labels_zoomed;
                 DrawSong {
                     pos,
+                    art: arts.get(s).cloned().flatten(),
+                    dimmed: has_focus && !in_focus,
                     fill,
                     ring,
                     big: is_hover || (in_focus && focus.len() == 1),
@@ -257,17 +271,33 @@ impl Frame {
             }
         }
 
+        let cover = cover_size(self.zoom);
+        let bg: Hsla = t.bg_app.into();
         for s in &self.songs {
             let c = tf.to_screen(s.pos);
-            let d = px(if s.big { 13. } else { 9. });
-            window.paint_quad(quad(
-                Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d)),
-                d / 2.,
-                s.fill,
-                px(1.5),
-                s.ring,
-                BorderStyle::Solid,
-            ));
+            let d = if let Some(img) = &s.art {
+                // Cover: image, a dimming veil when out of focus, then the key-coloured outline.
+                let d = px(if s.big { cover * 1.5 } else { cover });
+                let b = Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d));
+                let radius = px(3.);
+                let _ = window.paint_image(b, b, radius.into(), img.clone(), 0, s.dimmed);
+                if s.dimmed {
+                    window.paint_quad(quad(b, radius, bg.opacity(0.7), px(0.), bg, BorderStyle::Solid));
+                }
+                window.paint_quad(quad(b, radius, transparent_black(), px(1.5), s.ring, BorderStyle::Solid));
+                d
+            } else {
+                let d = px(if s.big { 13. } else { 9. });
+                window.paint_quad(quad(
+                    Bounds::new(point(c.x - d / 2., c.y - d / 2.), size(d, d)),
+                    d / 2.,
+                    s.fill,
+                    px(1.5),
+                    s.ring,
+                    BorderStyle::Solid,
+                ));
+                d
+            };
             if let Some(label) = &s.label {
                 let at = point(c.x + d / 2. + px(5.), c.y);
                 paint_text(window, cx, &font, label, 12., s.label_color, at, false);
@@ -306,7 +336,8 @@ fn paint_text(
     let shaped =
         window.text_system().shape_line(SharedString::from(text.to_string()), px(size_px), &[run], None);
     let x = if centered { at.x - shaped.width / 2. } else { at.x };
-    let _ = shaped.paint(point(x, at.y - line_height / 2.), line_height, window, cx);
+    let origin = point(x, at.y - line_height / 2.);
+    let _ = shaped.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
 }
 
 #[cfg(test)]

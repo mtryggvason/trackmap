@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/core", "crates/graph", "crates/app"]
+exclude = ["vendor"]
 
 [workspace.package]
 edition = "2021"
@@ -10,5 +11,15 @@ license = "MIT"
 [workspace.dependencies]
 trackmap-core = { path = "crates/core" }
 trackmap-graph = { path = "crates/graph" }
+# GPUI from Zed's repo at a pinned commit, checked out into vendor/zed by
+# scripts/fetch-gpui.sh (the 0.2.2 release has no trackpad pinch support).
+gpui = { path = "vendor/zed/crates/gpui" }
 # runtime_shaders: compile Metal shaders at startup so a full Xcode install is not required.
-gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+gpui_platform = { path = "vendor/zed/crates/gpui_platform", features = ["font-kit", "runtime_shaders"] }
+
+# Keep target/ small: full debug info only for our own crates, none for dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

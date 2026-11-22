@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod changes;
 pub mod key;
+pub mod playlists;
 pub mod scan;
 pub mod settings;
 pub mod watch;
@@ -13,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 pub use changes::{changes_for, Change};
 pub use key::Camelot;
+pub use playlists::Playlist;
 pub use scan::{open, scan, Library, ScanReport};
 pub use watch::{watch, Watcher};
 
@@ -68,12 +70,6 @@ pub struct Track {
     /// File size and modification time (Unix seconds), used to skip re-reading unchanged files.
     pub size: u64,
     pub modified: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Playlist {
-    pub name: String,
-    pub tracks: Vec<TrackId>,
 }
 
 #[cfg(test)]

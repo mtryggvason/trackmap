@@ -1466,6 +1466,8 @@ impl Workspace {
             shown.hash(&mut h);
             h.finish()
         };
+        // A filter that changes what's shown recentres the view so everything fits.
+        self.map.follow_filter(signature, subset);
         // Positions (and the drawn axis) for a tempo bin width, cached per (bin, graph, shown).
         let place = |bin: f32, cache: &mut Option<(f32, Rc<Graph>, u64, Rc<Vec<trackmap_graph::Point>>)>| {
             match cache {

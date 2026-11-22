@@ -175,6 +175,10 @@ pub struct MapState {
     /// How far each song has grown towards its hover/selected size (0 → 1), eased over time.
     grow: HashMap<usize, f32>,
     grow_step: Option<Instant>,
+    /// The shown songs last frame (a hash) and whether they were a filtered subset, to notice
+    /// when a filter changes what's shown.
+    shown_sig: Option<u64>,
+    was_subset: bool,
 }
 
 impl Default for MapState {
@@ -204,6 +208,8 @@ impl Default for MapState {
             glide: None,
             grow: HashMap::new(),
             grow_step: None,
+            shown_sig: None,
+            was_subset: false,
         }
     }
 }
@@ -312,6 +318,20 @@ impl MapState {
             to: (self.pan, zoom),
             anchor: Some((world, anchor)),
         });
+    }
+
+    /// Called each frame with what's shown. When a filter changes the set of songs (or is
+    /// cleared), the camera glides back to centre at normal zoom so every shown song fits.
+    /// Library changes with no filter involved, and group changes (which manage the view
+    /// themselves), leave the view alone.
+    pub fn follow_filter(&mut self, signature: u64, subset: bool) {
+        let changed = self.shown_sig.is_some_and(|s| s != signature);
+        if changed && (subset || self.was_subset) && self.view_motion.is_none() && self.pinch.is_none() {
+            self.glide = None;
+            self.move_view_to(point(px(0.), px(0.)), 1.0);
+        }
+        self.shown_sig = Some(signature);
+        self.was_subset = subset;
     }
 
     /// Stops any camera transition (the user is steering).
@@ -1223,6 +1243,32 @@ mod tests {
         }
         assert_eq!(s.grow_of(3), 0.0);
         assert!(s.grow.is_empty());
+    }
+
+    #[test]
+    fn filtering_recentres_but_library_changes_do_not() {
+        let settle = |s: &mut MapState| {
+            s.step_view(Instant::now() + TRANSITION * 2);
+        };
+        let mut s = MapState::default();
+        s.follow_filter(1, false); // first frame: whole library
+        s.pan = point(px(300.), px(-80.));
+        s.zoom = 4.0;
+
+        s.follow_filter(2, false); // a new file arrived, no filter: view untouched
+        assert!(s.view_motion.is_none());
+
+        s.follow_filter(3, true); // a search narrowed it down
+        settle(&mut s);
+        assert_eq!((s.pan, s.zoom), (point(px(0.), px(0.)), 1.0));
+
+        s.zoom = 3.0;
+        s.follow_filter(3, true); // same results: leave the user's zoom alone
+        assert!(s.view_motion.is_none());
+
+        s.follow_filter(2, false); // filter cleared: recentre on the whole library
+        settle(&mut s);
+        assert_eq!(s.zoom, 1.0);
     }
 
     #[test]

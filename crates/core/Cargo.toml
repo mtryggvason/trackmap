@@ -5,3 +5,8 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+lofty = "0.25.5"
+walkdir = "2.5.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,10 +1,12 @@
 //! Library model shared by the graph and the app. No UI code lives here.
 
 pub mod key;
+pub mod scan;
 
 use std::path::{Path, PathBuf};
 
 pub use key::Camelot;
+pub use scan::{scan, Library};
 
 /// File extensions the Devious Pocket can play (docs.nap.works). AAC/m4a is not supported.
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
